@@ -39,6 +39,7 @@ type Server struct {
 	Config    *Config
 	SSHConfig *ssh.ServerConfig
 	WorkDir   string
+	Verbose   bool
 }
 
 func NewServer(workDir string) (*Server, error) {
@@ -67,6 +68,16 @@ func NewServer(workDir string) (*Server, error) {
 	fingerprint := ssh.FingerprintSHA256(hostSigner.PublicKey())
 	log.Printf("Host key fingerprint: %s", fingerprint)
 
+	if len(cfg.Packages) > 0 {
+		binPath, err := BuildNixEnv(cfg.Packages)
+		if err != nil {
+			log.Printf("Warning: failed to build nix packages environment: %v", err)
+		} else if binPath != "" {
+			cfg.PackageBinPath = binPath
+			log.Printf("Nix environment prepared: %s", binPath)
+		}
+	}
+
 	return &Server{
 		Config:    cfg,
 		SSHConfig: sshConfig,
@@ -80,14 +91,14 @@ func (s *Server) Serve(listener net.Listener) error {
 		if err != nil {
 			return err
 		}
-		go handleConn(conn, s.SSHConfig, s.WorkDir)
+		go handleConn(conn, s)
 	}
 }
 
-func handleConn(tcpConn net.Conn, sshConfig *ssh.ServerConfig, workDir string) {
+func handleConn(tcpConn net.Conn, srv *Server) {
 	defer tcpConn.Close()
 
-	serverConn, chans, reqs, err := ssh.NewServerConn(tcpConn, sshConfig)
+	serverConn, chans, reqs, err := ssh.NewServerConn(tcpConn, srv.SSHConfig)
 	if err != nil {
 		log.Printf("SSH handshake failed from %s: %v", tcpConn.RemoteAddr(), err)
 		return
@@ -109,16 +120,18 @@ func handleConn(tcpConn net.Conn, sshConfig *ssh.ServerConfig, workDir string) {
 			return
 		}
 
-		go handleSession(channel, requests, workDir)
+		go handleSession(channel, requests, srv)
 	}
 }
 
-func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, workDir string) {
+func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Server) {
 	defer channel.Close()
 
 	winCh := make(chan WindowChange, 16)
 	sCtx := SessionContext{
-		WinCh: winCh,
+		WinCh:          winCh,
+		Binds:          srv.Config.ParsedBinds,
+		PackageBinPath: srv.Config.PackageBinPath,
 	}
 
 	for req := range requests {
@@ -160,7 +173,10 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, workDir st
 
 		case "shell":
 			_ = req.Reply(true, nil)
-			if err := runInBwrap(channel, workDir, sCtx); err != nil {
+			if srv.Verbose {
+				log.Printf("Executing interactive shell in jail")
+			}
+			if err := runInBwrap(channel, srv.WorkDir, sCtx); err != nil {
 				log.Printf("Bubblewrap interactive shell finished with error: %v", err)
 			}
 			return
@@ -173,17 +189,21 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, workDir st
 			}
 			_ = req.Reply(true, nil)
 
+			if srv.Verbose {
+				log.Printf("Executing command: %s", msg.Command)
+			}
+
 			cmdArgs := tokenizeCommand(msg.Command)
 			if len(cmdArgs) > 0 && cmdArgs[0] == "scp" {
 				log.Printf("Handling SCP request: %s", msg.Command)
-				if err := handleSCP(channel, workDir, cmdArgs[1:]); err != nil {
+				if err := handleSCP(channel, srv.WorkDir, cmdArgs[1:]); err != nil {
 					log.Printf("SCP command %q finished with error: %v", msg.Command, err)
 				}
 				return
 			}
 
 			sCtx.Command = msg.Command
-			if err := runInBwrap(channel, workDir, sCtx); err != nil {
+			if err := runInBwrap(channel, srv.WorkDir, sCtx); err != nil {
 				log.Printf("Bubblewrap exec command %q finished with error: %v", msg.Command, err)
 			}
 			return

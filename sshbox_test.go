@@ -54,6 +54,95 @@ func TestConfigLoadAndGenerate(t *testing.T) {
 	}
 }
 
+func TestConfigBinds(t *testing.T) {
+	tempDir := t.TempDir()
+
+	tomlData := `
+authorized_keys = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKey user@host"]
+bind = [
+    "extra:/opt/extra",
+    "/var/data:/data:ro",
+    "shared:/shared:rw",
+]
+`
+	configPath := filepath.Join(tempDir, ".bashbox.toml")
+	if err := os.WriteFile(configPath, []byte(tomlData), 0600); err != nil {
+		t.Fatalf("write toml: %v", err)
+	}
+
+	cfg, _, err := LoadOrInitConfig(tempDir)
+	if err != nil {
+		t.Fatalf("LoadOrInitConfig failed: %v", err)
+	}
+
+	if len(cfg.ParsedBinds) != 3 {
+		t.Fatalf("expected 3 parsed binds, got %d", len(cfg.ParsedBinds))
+	}
+
+	// 1. extra:/opt/extra -> relative, default ro
+	if cfg.ParsedBinds[0].HostPath != filepath.Join(tempDir, "extra") {
+		t.Errorf("expected host path %s, got %s", filepath.Join(tempDir, "extra"), cfg.ParsedBinds[0].HostPath)
+	}
+	if cfg.ParsedBinds[0].JailPath != "/opt/extra" {
+		t.Errorf("expected jail path /opt/extra, got %s", cfg.ParsedBinds[0].JailPath)
+	}
+	if cfg.ParsedBinds[0].ReadWrite != false {
+		t.Errorf("expected ReadWrite=false, got true")
+	}
+
+	// 2. /var/data:/data:ro -> absolute, ro
+	if cfg.ParsedBinds[1].HostPath != "/var/data" {
+		t.Errorf("expected host path /var/data, got %s", cfg.ParsedBinds[1].HostPath)
+	}
+	if cfg.ParsedBinds[1].JailPath != "/data" {
+		t.Errorf("expected jail path /data, got %s", cfg.ParsedBinds[1].JailPath)
+	}
+	if cfg.ParsedBinds[1].ReadWrite != false {
+		t.Errorf("expected ReadWrite=false, got true")
+	}
+
+	// 3. shared:/shared:rw -> relative, rw
+	if cfg.ParsedBinds[2].HostPath != filepath.Join(tempDir, "shared") {
+		t.Errorf("expected host path %s, got %s", filepath.Join(tempDir, "shared"), cfg.ParsedBinds[2].HostPath)
+	}
+	if cfg.ParsedBinds[2].JailPath != "/shared" {
+		t.Errorf("expected jail path /shared, got %s", cfg.ParsedBinds[2].JailPath)
+	}
+	if cfg.ParsedBinds[2].ReadWrite != true {
+		t.Errorf("expected ReadWrite=true, got false")
+	}
+}
+
+func TestNixPackageValidation(t *testing.T) {
+	valid := []string{"ripgrep", "jq", "curl", "hello", "which"}
+	for _, p := range valid {
+		if !validPkgName.MatchString(p) {
+			t.Errorf("expected %q to be valid package name", p)
+		}
+	}
+
+	malicious := []string{
+		`hello; builtins.trace "pwned" hello`,
+		`hello [ "pwned" ]`,
+		`(import /etc/passwd)`,
+		`pkg"`,
+		`pkg$foo`,
+		`pkg/foo`,
+		"pkg\nfoo",
+		`pkg$(whoami)`,
+		`pkg'foo`,
+	}
+	for _, p := range malicious {
+		if validPkgName.MatchString(p) {
+			t.Errorf("expected malicious payload %q to be rejected, but matched as valid", p)
+		}
+		_, err := BuildNixEnv([]string{p})
+		if err == nil {
+			t.Errorf("expected BuildNixEnv to fail on payload %q, but got nil error", p)
+		}
+	}
+}
+
 func TestResolveAndValidatePath(t *testing.T) {
 	tempDir := t.TempDir()
 
@@ -129,9 +218,27 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 		t.Fatalf("generate unauth key: %v", err)
 	}
 
-	// Write .bashbox.toml with the authorized public key using toml marshaller
+	// Setup extra and shared directories for custom bind tests
+	extraDir := filepath.Join(workDir, "extra_src")
+	if err := os.MkdirAll(extraDir, 0755); err != nil {
+		t.Fatalf("mkdir extra_src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(extraDir, "hello.txt"), []byte("from_extra"), 0644); err != nil {
+		t.Fatalf("write extra hello: %v", err)
+	}
+
+	sharedDir := filepath.Join(workDir, "shared_src")
+	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+		t.Fatalf("mkdir shared_src: %v", err)
+	}
+
+	// Write .bashbox.toml with authorized key and custom binds
 	tomlBytes, err := toml.Marshal(&Config{
 		AuthorizedKeys: []string{authKeyLine},
+		Bind: []string{
+			"extra_src:/opt/extra",
+			"shared_src:/shared:rw",
+		},
 	})
 	if err != nil {
 		t.Fatalf("marshal .bashbox.toml: %v", err)
@@ -353,6 +460,45 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 		}
 		if strings.TrimSpace(string(content)) != "file_from_jail" {
 			t.Errorf("expected 'file_from_jail', got %q", string(content))
+		}
+	})
+
+	t.Run("BubblewrapCustomBinds", func(t *testing.T) {
+		checkBwrap(t)
+		session, err := client.NewSession()
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		defer session.Close()
+
+		// Read ro bind (/opt/extra/hello.txt)
+		out, err := session.CombinedOutput("cat /opt/extra/hello.txt")
+		if err != nil {
+			t.Fatalf("read /opt/extra/hello.txt: %v, out: %s", err, string(out))
+		}
+		if strings.TrimSpace(string(out)) != "from_extra" {
+			t.Errorf("expected 'from_extra', got %q", string(out))
+		}
+
+		// Verify ro bind fails on write
+		session2, _ := client.NewSession()
+		defer session2.Close()
+		if err := session2.Run("echo fail >> /opt/extra/hello.txt"); err == nil {
+			t.Error("expected write to ro bind to fail, but succeeded")
+		}
+
+		// Verify rw bind allows writing (/shared/test.txt)
+		session3, _ := client.NewSession()
+		defer session3.Close()
+		if err := session3.Run("echo 'written_in_shared' > /shared/test.txt"); err != nil {
+			t.Fatalf("write to rw bind failed: %v", err)
+		}
+		writtenData, err := os.ReadFile(filepath.Join(sharedDir, "test.txt"))
+		if err != nil {
+			t.Fatalf("read created file from host shared_src: %v", err)
+		}
+		if strings.TrimSpace(string(writtenData)) != "written_in_shared" {
+			t.Errorf("expected 'written_in_shared', got %q", string(writtenData))
 		}
 	})
 

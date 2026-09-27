@@ -15,13 +15,15 @@ import (
 )
 
 type SessionContext struct {
-	Command string
-	IsPty   bool
-	Term    string
-	Rows    uint32
-	Cols    uint32
-	WinCh   <-chan WindowChange
-	Env     []string
+	Command        string
+	IsPty          bool
+	Term           string
+	Rows           uint32
+	Cols           uint32
+	WinCh          <-chan WindowChange
+	Env            []string
+	Binds          []BindMount
+	PackageBinPath string
 }
 
 type WindowChange struct {
@@ -125,6 +127,9 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 	} else if !strings.Contains(pathEnv, "/bin") {
 		pathEnv = pathEnv + ":/run/current-system/sw/bin:/bin:/usr/bin"
 	}
+	if sCtx.PackageBinPath != "" {
+		pathEnv = sCtx.PackageBinPath + ":" + pathEnv
+	}
 
 	term := sCtx.Term
 	if term == "" {
@@ -133,7 +138,11 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 
 	args := []string{
 		"--die-with-parent",
-		"--new-session",
+	}
+	if !sCtx.IsPty {
+		args = append(args, "--new-session")
+	}
+	args = append(args,
 		"--hostname", "bashbox",
 		"--dev-bind", "/dev", "/dev",
 		"--proc", "/proc",
@@ -164,6 +173,19 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 		// Container home directory
 		"--dir", "/home/bashbox",
 		"--bind", containerHome, "/home/bashbox",
+	)
+
+	// Apply custom bind mounts from configuration
+	for _, bm := range sCtx.Binds {
+		args = append(args, "--dir", filepath.Dir(bm.JailPath))
+		if bm.ReadWrite {
+			args = append(args, "--bind-try", bm.HostPath, bm.JailPath)
+		} else {
+			args = append(args, "--ro-bind-try", bm.HostPath, bm.JailPath)
+		}
+	}
+
+	args = append(args,
 		// Hide .home inside /work by binding an empty read-only directory over it
 		"--ro-bind", emptyMaskDir, "/work/.home",
 		// Bind .bashbox.toml read-only to an empty file so it's inaccessible inside the sandbox
@@ -186,7 +208,7 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 		"--setenv", "NIX_CONFIG", "extra-experimental-features = nix-command flakes",
 		"--unshare-all",
 		"--share-net",
-	}
+	)
 
 	// Choose shell
 	shell := "sh"

@@ -13,17 +13,21 @@ func main() {
 	var port int
 	var host string
 	var workDir string
+	var verbose bool
 
 	flag.IntVar(&port, "p", 2222, "Port to listen on")
 	flag.IntVar(&port, "port", 2222, "Port to listen on")
 	flag.StringVar(&host, "host", "0.0.0.0", "Host/interface to listen on")
 	flag.StringVar(&workDir, "dir", ".", "Working directory to jail and serve (defaults to current directory)")
+	flag.BoolVar(&verbose, "v", false, "Log executed commands and detailed activity")
+	flag.BoolVar(&verbose, "verbose", false, "Log executed commands and detailed activity")
 	flag.Parse()
 
 	srv, err := sshbox.NewServer(workDir)
 	if err != nil {
 		log.Fatalf("Failed to initialize server: %v", err)
 	}
+	srv.Verbose = verbose
 
 	listenAddr := fmt.Sprintf("%s:%d", host, port)
 	listener, err := net.Listen("tcp", listenAddr)

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -16,11 +17,21 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+type BindMount struct {
+	HostPath  string
+	JailPath  string
+	ReadWrite bool
+}
+
 type Config struct {
 	AuthorizedKeys []string `toml:"authorized_keys"`
 	AuthorizedKey  string   `toml:"authorized_key,omitempty"`
 	HostKey        string   `toml:"host_key"`
+	Bind           []string `toml:"bind,omitempty"`
+	Packages       []string `toml:"packages,omitempty"`
 
+	ParsedBinds      []BindMount     `toml:"-"`
+	PackageBinPath   string          `toml:"-"`
 	parsedPublicKeys []ssh.PublicKey `toml:"-"`
 }
 
@@ -102,7 +113,70 @@ func LoadOrInitConfig(dir string) (*Config, ssh.Signer, error) {
 		log.Printf("Loaded %d authorized public key(s) from %s", len(cfg.parsedPublicKeys), configPath)
 	}
 
+	// Parse bind mounts
+	for _, spec := range cfg.Bind {
+		bm, err := parseBindString(dir, spec)
+		if err != nil {
+			log.Printf("Warning: failed to parse bind %q: %v", spec, err)
+			continue
+		}
+		if bm != nil {
+			cfg.ParsedBinds = append(cfg.ParsedBinds, *bm)
+		}
+	}
+
+	if len(cfg.ParsedBinds) > 0 {
+		log.Printf("Loaded %d bind mount(s) from %s", len(cfg.ParsedBinds), configPath)
+	}
+
 	return &cfg, signer, nil
+}
+
+func parseBindString(dir, spec string) (*BindMount, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil, nil
+	}
+	parts := strings.Split(spec, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return nil, fmt.Errorf("invalid bind spec %q: must be host:jail[:rw]", spec)
+	}
+
+	hostPath := strings.TrimSpace(parts[0])
+	jailPath := strings.TrimSpace(parts[1])
+	if hostPath == "" || jailPath == "" {
+		return nil, fmt.Errorf("invalid bind spec %q: host and jail paths cannot be empty", spec)
+	}
+
+	if !filepath.IsAbs(hostPath) {
+		hostPath = filepath.Clean(filepath.Join(dir, hostPath))
+	} else {
+		hostPath = filepath.Clean(hostPath)
+	}
+
+	jailPath = path.Clean(jailPath)
+	if !strings.HasPrefix(jailPath, "/") {
+		jailPath = "/" + jailPath
+	}
+
+	rw := false
+	if len(parts) == 3 {
+		mode := strings.ToLower(strings.TrimSpace(parts[2]))
+		switch mode {
+		case "rw":
+			rw = true
+		case "ro":
+			rw = false
+		default:
+			return nil, fmt.Errorf("invalid bind mode %q in %q: must be 'ro' or 'rw'", parts[2], spec)
+		}
+	}
+
+	return &BindMount{
+		HostPath:  hostPath,
+		JailPath:  jailPath,
+		ReadWrite: rw,
+	}, nil
 }
 
 func (c *Config) Authenticate(key ssh.PublicKey) bool {
@@ -143,6 +217,22 @@ func saveConfig(path string, cfg *Config) error {
 		sb.WriteString("authorized_keys = [\n    # \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... user@host\"\n]\n\n")
 	} else {
 		encoded, err := toml.Marshal(map[string][]string{"authorized_keys": cfg.AuthorizedKeys})
+		if err == nil {
+			sb.WriteString(string(encoded))
+			sb.WriteString("\n")
+		}
+	}
+
+	if len(cfg.Bind) > 0 {
+		encoded, err := toml.Marshal(map[string][]string{"bind": cfg.Bind})
+		if err == nil {
+			sb.WriteString(string(encoded))
+			sb.WriteString("\n")
+		}
+	}
+
+	if len(cfg.Packages) > 0 {
+		encoded, err := toml.Marshal(map[string][]string{"packages": cfg.Packages})
 		if err == nil {
 			sb.WriteString(string(encoded))
 			sb.WriteString("\n")
