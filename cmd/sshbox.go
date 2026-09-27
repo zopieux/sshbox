@@ -14,6 +14,9 @@ func main() {
 	var host string
 	var workDir string
 	var verbose bool
+	var enableSCP bool
+	var enableGPU bool
+	var enableNet bool
 
 	flag.IntVar(&port, "p", 2222, "Port to listen on")
 	flag.IntVar(&port, "port", 2222, "Port to listen on")
@@ -21,13 +24,20 @@ func main() {
 	flag.StringVar(&workDir, "dir", ".", "Working directory to jail and serve (defaults to current directory)")
 	flag.BoolVar(&verbose, "v", false, "Log executed commands and detailed activity")
 	flag.BoolVar(&verbose, "verbose", false, "Log executed commands and detailed activity")
+	flag.BoolVar(&enableSCP, "scp", false, "Enable scp support inside the jail (default: disabled)")
+	flag.BoolVar(&enableGPU, "gpu", false, "Enable GPU and host /dev access inside the jail (default: disabled)")
+	flag.BoolVar(&enableNet, "net", false, "Enable network access inside the jail (default: disabled)")
 	flag.Parse()
 
-	srv, err := sshbox.NewServer(workDir)
+	srv, err := sshbox.NewServer(workDir,
+		sshbox.WithVerbose(verbose),
+		sshbox.WithSCP(enableSCP),
+		sshbox.WithGPU(enableGPU),
+		sshbox.WithNet(enableNet),
+	)
 	if err != nil {
 		log.Fatalf("Failed to initialize server: %v", err)
 	}
-	srv.Verbose = verbose
 
 	listenAddr := fmt.Sprintf("%s:%d", host, port)
 	listener, err := net.Listen("tcp", listenAddr)

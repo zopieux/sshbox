@@ -29,6 +29,9 @@ type Config struct {
 	HostKey        string   `toml:"host_key"`
 	Bind           []string `toml:"bind,omitempty"`
 	Packages       []string `toml:"packages,omitempty"`
+	SCP            *bool    `toml:"scp,omitempty"`
+	GPU            *bool    `toml:"gpu,omitempty"`
+	Net            *bool    `toml:"net,omitempty"`
 
 	ParsedBinds      []BindMount     `toml:"-"`
 	PackageBinPath   string          `toml:"-"`

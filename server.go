@@ -1,9 +1,11 @@
 package sshbox
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -40,9 +42,30 @@ type Server struct {
 	SSHConfig *ssh.ServerConfig
 	WorkDir   string
 	Verbose   bool
+	EnableSCP bool
+	EnableGPU bool
+	EnableNet bool
 }
 
-func NewServer(workDir string) (*Server, error) {
+type ServerOption func(*Server)
+
+func WithVerbose(v bool) ServerOption {
+	return func(s *Server) { s.Verbose = v }
+}
+
+func WithSCP(enable bool) ServerOption {
+	return func(s *Server) { s.EnableSCP = enable }
+}
+
+func WithGPU(enable bool) ServerOption {
+	return func(s *Server) { s.EnableGPU = enable }
+}
+
+func WithNet(enable bool) ServerOption {
+	return func(s *Server) { s.EnableNet = enable }
+}
+
+func NewServer(workDir string, opts ...ServerOption) (*Server, error) {
 	absWorkDir, err := filepath.Abs(workDir)
 	if err != nil {
 		return nil, fmt.Errorf("determine absolute path for %s: %w", workDir, err)
@@ -51,6 +74,25 @@ func NewServer(workDir string) (*Server, error) {
 	cfg, hostSigner, err := LoadOrInitConfig(absWorkDir)
 	if err != nil {
 		return nil, fmt.Errorf("initialize config: %w", err)
+	}
+
+	srv := &Server{
+		Config:  cfg,
+		WorkDir: absWorkDir,
+	}
+
+	if cfg.SCP != nil {
+		srv.EnableSCP = *cfg.SCP
+	}
+	if cfg.GPU != nil {
+		srv.EnableGPU = *cfg.GPU
+	}
+	if cfg.Net != nil {
+		srv.EnableNet = *cfg.Net
+	}
+
+	for _, opt := range opts {
+		opt(srv)
 	}
 
 	sshConfig := &ssh.ServerConfig{
@@ -64,25 +106,45 @@ func NewServer(workDir string) (*Server, error) {
 		},
 	}
 	sshConfig.AddHostKey(hostSigner)
+	srv.SSHConfig = sshConfig
 
 	fingerprint := ssh.FingerprintSHA256(hostSigner.PublicKey())
 	log.Printf("Host key fingerprint: %s", fingerprint)
 
-	if len(cfg.Packages) > 0 {
-		binPath, err := BuildNixEnv(cfg.Packages)
+	pkgs := cfg.Packages
+	if srv.EnableSCP {
+		hasOpenSSH := false
+		for _, p := range pkgs {
+			if p == "openssh" {
+				hasOpenSSH = true
+				break
+			}
+		}
+		if !hasOpenSSH {
+			pkgs = append([]string{"openssh"}, pkgs...)
+		}
+	}
+
+	if len(pkgs) > 0 {
+		binPath, err := BuildNixEnv(pkgs)
 		if err != nil {
 			log.Printf("Warning: failed to build nix packages environment: %v", err)
+			if srv.EnableSCP && cfg.PackageBinPath == "" {
+				if hostSCP, err := exec.LookPath("scp"); err == nil {
+					cfg.PackageBinPath = filepath.Dir(hostSCP)
+				}
+			}
 		} else if binPath != "" {
 			cfg.PackageBinPath = binPath
 			log.Printf("Nix environment prepared: %s", binPath)
 		}
+	} else if srv.EnableSCP {
+		if hostSCP, err := exec.LookPath("scp"); err == nil {
+			cfg.PackageBinPath = filepath.Dir(hostSCP)
+		}
 	}
 
-	return &Server{
-		Config:    cfg,
-		SSHConfig: sshConfig,
-		WorkDir:   absWorkDir,
-	}, nil
+	return srv, nil
 }
 
 func (s *Server) Serve(listener net.Listener) error {
@@ -128,10 +190,14 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Serve
 	defer channel.Close()
 
 	winCh := make(chan WindowChange, 16)
+	defer close(winCh)
+
 	sCtx := SessionContext{
 		WinCh:          winCh,
 		Binds:          srv.Config.ParsedBinds,
 		PackageBinPath: srv.Config.PackageBinPath,
+		EnableGPU:      srv.EnableGPU,
+		EnableNet:      srv.EnableNet,
 	}
 
 	for req := range requests {
@@ -176,6 +242,24 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Serve
 			if srv.Verbose {
 				log.Printf("Executing interactive shell in jail")
 			}
+			go func() {
+				for r := range requests {
+					if r.Type == "window-change" {
+						var msg winChangeMsg
+						if err := ssh.Unmarshal(r.Payload, &msg); err == nil {
+							select {
+							case winCh <- WindowChange{Rows: msg.Rows, Cols: msg.Cols}:
+							default:
+							}
+							_ = r.Reply(true, nil)
+						} else {
+							_ = r.Reply(false, nil)
+						}
+					} else {
+						_ = r.Reply(false, nil)
+					}
+				}
+			}()
 			if err := runInBwrap(channel, srv.WorkDir, sCtx); err != nil {
 				log.Printf("Bubblewrap interactive shell finished with error: %v", err)
 			}
@@ -194,11 +278,9 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Serve
 			}
 
 			cmdArgs := tokenizeCommand(msg.Command)
-			if len(cmdArgs) > 0 && cmdArgs[0] == "scp" {
-				log.Printf("Handling SCP request: %s", msg.Command)
-				if err := handleSCP(channel, srv.WorkDir, cmdArgs[1:]); err != nil {
-					log.Printf("SCP command %q finished with error: %v", msg.Command, err)
-				}
+			if len(cmdArgs) > 0 && cmdArgs[0] == "scp" && !srv.EnableSCP {
+				log.Printf("SCP command rejected: scp is disabled (enable with --scp)")
+				sendExitStatus(channel, errors.New("scp is disabled on this server (enable with --scp)"))
 				return
 			}
 

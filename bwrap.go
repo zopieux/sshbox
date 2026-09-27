@@ -24,6 +24,8 @@ type SessionContext struct {
 	Env            []string
 	Binds          []BindMount
 	PackageBinPath string
+	EnableGPU      bool
+	EnableNet      bool
 }
 
 type WindowChange struct {
@@ -48,37 +50,8 @@ func getBwrapPath() (string, error) {
 	return "", errors.New("bubblewrap (bwrap) not found in PATH")
 }
 
-func getEmptyFilePath() (string, error) {
-	emptyPath := filepath.Join(os.TempDir(), "sshbox-empty-bind")
-	if _, err := os.Stat(emptyPath); err == nil {
-		return emptyPath, nil
-	}
-	if err := os.WriteFile(emptyPath, []byte{}, 0644); err != nil {
-		return "", fmt.Errorf("create empty mask file: %w", err)
-	}
-	return emptyPath, nil
-}
-
-func getEmptyDirPath() (string, error) {
-	emptyDir := filepath.Join(os.TempDir(), "sshbox-empty-dir")
-	if err := os.MkdirAll(emptyDir, 0755); err != nil {
-		return "", fmt.Errorf("create empty mask dir: %w", err)
-	}
-	return emptyDir, nil
-}
-
 func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 	bwrapPath, err := getBwrapPath()
-	if err != nil {
-		return err
-	}
-
-	emptyMaskFile, err := getEmptyFilePath()
-	if err != nil {
-		return err
-	}
-
-	emptyMaskDir, err := getEmptyDirPath()
 	if err != nil {
 		return err
 	}
@@ -120,6 +93,14 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 		_, _ = wGroup.WriteString(groupContent)
 	}()
 
+	// Empty read pipe for masking files via FD 5 with --ro-bind-data
+	rEmpty, wEmpty, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("create empty pipe: %w", err)
+	}
+	defer rEmpty.Close()
+	_ = wEmpty.Close()
+
 	// Build PATH for the sandbox
 	pathEnv := os.Getenv("PATH")
 	if pathEnv == "" {
@@ -144,15 +125,27 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 	}
 	args = append(args,
 		"--hostname", "sshbox",
-		"--dev-bind", "/dev", "/dev",
+	)
+
+	if sCtx.EnableGPU {
+		args = append(args,
+			"--dev-bind", "/dev", "/dev",
+			"--ro-bind-try", "/run/opengl-driver", "/run/opengl-driver",
+			"--ro-bind-try", "/run/opengl-driver-32", "/run/opengl-driver-32",
+		)
+	} else {
+		args = append(args,
+			"--dev", "/dev",
+		)
+	}
+
+	args = append(args,
 		"--proc", "/proc",
 		"--ro-bind-try", "/sys", "/sys",
 		"--tmpfs", "/tmp",
 		"--ro-bind", "/nix/store", "/nix/store",
 		"--ro-bind-try", "/nix/var", "/nix/var",
 		"--ro-bind-try", "/run/current-system", "/run/current-system",
-		"--ro-bind-try", "/run/opengl-driver", "/run/opengl-driver",
-		"--ro-bind-try", "/run/opengl-driver-32", "/run/opengl-driver-32",
 		"--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve",
 		"--ro-bind-try", "/bin", "/bin",
 		"--ro-bind-try", "/usr/bin", "/usr/bin",
@@ -168,6 +161,7 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 		"--ro-bind-try", "/etc/ssl", "/etc/ssl",
 		"--ro-bind-try", "/etc/pki", "/etc/pki",
 		"--ro-bind-try", "/etc/localtime", "/etc/localtime",
+		"--remount-ro", "/etc",
 		// Read-write bind of current directory to /work
 		"--bind", dir, "/work",
 		// Container home directory
@@ -186,10 +180,11 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 	}
 
 	args = append(args,
-		// Hide .home inside /work by binding an empty read-only directory over it
-		"--ro-bind", emptyMaskDir, "/work/.home",
-		// Bind .sshbox.toml read-only to an empty file so it's inaccessible inside the sandbox
-		"--ro-bind", emptyMaskFile, "/work/.sshbox.toml",
+		// Hide .home inside /work by mounting an empty read-only tmpfs over it
+		"--tmpfs", "/work/.home",
+		"--remount-ro", "/work/.home",
+		// Bind .sshbox.toml read-only to empty data via FD 5
+		"--perms", "0444", "--ro-bind-data", "5", "/work/.sshbox.toml",
 		"--chdir", "/work",
 		"--clearenv",
 		"--setenv", "USER", "sshbox",
@@ -207,8 +202,11 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 		"--setenv", "PATH", pathEnv,
 		"--setenv", "NIX_CONFIG", "extra-experimental-features = nix-command flakes",
 		"--unshare-all",
-		"--share-net",
 	)
+
+	if sCtx.EnableNet {
+		args = append(args, "--share-net")
+	}
 
 	// Choose shell
 	shell := "sh"
@@ -223,8 +221,8 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 	}
 
 	cmd := exec.Command(bwrapPath, args...)
-	// ExtraFiles are mapped to file descriptors 3, 4, ...
-	cmd.ExtraFiles = []*os.File{rPasswd, rGroup}
+	// ExtraFiles are mapped to file descriptors 3 (passwd), 4 (group), 5 (empty)
+	cmd.ExtraFiles = []*os.File{rPasswd, rGroup, rEmpty}
 
 	if sCtx.IsPty {
 		ws := &pty.Winsize{
