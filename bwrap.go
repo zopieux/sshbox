@@ -92,11 +92,11 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 	uid := os.Getuid()
 	gid := os.Getgid()
 	passwdContent := fmt.Sprintf(
-		"root:x:0:0:root:/root:/bin/sh\nbashbox:x:%d:%d:Bashbox User:/home/bashbox:/bin/sh\nnobody:x:65534:65534:Nobody:/:/bin/false\n",
+		"root:x:0:0:root:/root:/bin/sh\nsshbox:x:%d:%d:Sshbox User:/home/sshbox:/bin/sh\nnobody:x:65534:65534:Nobody:/:/bin/false\n",
 		uid, gid,
 	)
 	groupContent := fmt.Sprintf(
-		"root:x:0:\nbashbox:x:%d:\nnogroup:x:65534:\n",
+		"root:x:0:\nsshbox:x:%d:\nnogroup:x:65534:\n",
 		gid,
 	)
 
@@ -143,7 +143,7 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 		args = append(args, "--new-session")
 	}
 	args = append(args,
-		"--hostname", "bashbox",
+		"--hostname", "sshbox",
 		"--dev-bind", "/dev", "/dev",
 		"--proc", "/proc",
 		"--ro-bind-try", "/sys", "/sys",
@@ -171,8 +171,8 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 		// Read-write bind of current directory to /work
 		"--bind", dir, "/work",
 		// Container home directory
-		"--dir", "/home/bashbox",
-		"--bind", containerHome, "/home/bashbox",
+		"--dir", "/home/sshbox",
+		"--bind", containerHome, "/home/sshbox",
 	)
 
 	// Apply custom bind mounts from configuration
@@ -188,13 +188,13 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 	args = append(args,
 		// Hide .home inside /work by binding an empty read-only directory over it
 		"--ro-bind", emptyMaskDir, "/work/.home",
-		// Bind .bashbox.toml read-only to an empty file so it's inaccessible inside the sandbox
-		"--ro-bind", emptyMaskFile, "/work/.bashbox.toml",
+		// Bind .sshbox.toml read-only to an empty file so it's inaccessible inside the sandbox
+		"--ro-bind", emptyMaskFile, "/work/.sshbox.toml",
 		"--chdir", "/work",
 		"--clearenv",
-		"--setenv", "USER", "bashbox",
-		"--setenv", "LOGNAME", "bashbox",
-		"--setenv", "HOME", "/home/bashbox",
+		"--setenv", "USER", "sshbox",
+		"--setenv", "LOGNAME", "sshbox",
+		"--setenv", "HOME", "/home/sshbox",
 		"--setenv", "PWD", "/work",
 		"--setenv", "SHELL", "/bin/sh",
 		"--setenv", "TMPDIR", "/tmp",

@@ -59,7 +59,7 @@ func NewServer(workDir string) (*Server, error) {
 				log.Printf("Accepted public key authentication for user %q (%s)", conn.User(), key.Type())
 				return nil, nil
 			}
-			log.Printf("Rejected authentication for user %q: public key not in .bashbox.toml", conn.User())
+			log.Printf("Rejected authentication for user %q: public key not in .sshbox.toml", conn.User())
 			return nil, fmt.Errorf("public key authentication failed")
 		},
 	}

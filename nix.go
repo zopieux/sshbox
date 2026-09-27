@@ -45,7 +45,7 @@ func BuildNixEnv(packages []string) (string, error) {
 	log.Printf("Building nix environment for packages: %v ...", packages)
 
 	expr := fmt.Sprintf(
-		`let pkgs = if builtins ? getFlake then (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem} else import <nixpkgs> {}; in pkgs.buildEnv { name = "bashbox-env"; paths = map (name: pkgs.${name}) [ %s ]; }`,
+		`let pkgs = if builtins ? getFlake then (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem} else import <nixpkgs> {}; in pkgs.buildEnv { name = "sshbox-env"; paths = map (name: pkgs.${name}) [ %s ]; }`,
 		strings.Join(quotedPkgs, " "),
 	)
 

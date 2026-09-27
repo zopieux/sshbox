@@ -71,7 +71,7 @@ func parseSCPArgs(args []string) (*scpOptions, error) {
 }
 
 // resolveAndValidatePath maps requested path to host path and enforces:
-// "it only accepts dealing with files in /work & /home/bashbox"
+// "it only accepts dealing with files in /work & /home/sshbox"
 func resolveAndValidatePath(baseDir, reqPath string) (string, error) {
 	var clean string
 	if !strings.HasPrefix(reqPath, "/") {
@@ -86,20 +86,20 @@ func resolveAndValidatePath(baseDir, reqPath string) (string, error) {
 	}
 
 	inWork := clean == "/work" || strings.HasPrefix(clean, "/work/")
-	inHome := clean == "/home/bashbox" || strings.HasPrefix(clean, "/home/bashbox/")
+	inHome := clean == "/home/sshbox" || strings.HasPrefix(clean, "/home/sshbox/")
 
 	if !inWork && !inHome {
-		return "", fmt.Errorf("scp access denied: path %q must be within /work or /home/bashbox", reqPath)
+		return "", fmt.Errorf("scp access denied: path %q must be within /work or /home/sshbox", reqPath)
 	}
 
-	// Security: prohibit access to .bashbox.toml
-	if clean == "/work/.bashbox.toml" || strings.HasPrefix(clean, "/work/.bashbox.toml/") {
-		return "", fmt.Errorf("scp access denied: cannot access .bashbox.toml")
+	// Security: prohibit access to .sshbox.toml
+	if clean == "/work/.sshbox.toml" || strings.HasPrefix(clean, "/work/.sshbox.toml/") {
+		return "", fmt.Errorf("scp access denied: cannot access .sshbox.toml")
 	}
 
-	// Hide .home when requested via /work (use /home/bashbox instead)
+	// Hide .home when requested via /work (use /home/sshbox instead)
 	if clean == "/work/.home" || strings.HasPrefix(clean, "/work/.home/") {
-		return "", fmt.Errorf("scp access denied: cannot access .home via /work; use /home/bashbox")
+		return "", fmt.Errorf("scp access denied: cannot access .home via /work; use /home/sshbox")
 	}
 
 	workHostDir := filepath.Clean(baseDir)
@@ -111,7 +111,7 @@ func resolveAndValidatePath(baseDir, reqPath string) (string, error) {
 		rel = strings.TrimPrefix(rel, "/")
 		hostPath = filepath.Join(workHostDir, filepath.FromSlash(rel))
 	} else {
-		rel := strings.TrimPrefix(clean, "/home/bashbox")
+		rel := strings.TrimPrefix(clean, "/home/sshbox")
 		rel = strings.TrimPrefix(rel, "/")
 		hostPath = filepath.Join(homeHostDir, filepath.FromSlash(rel))
 	}
@@ -125,9 +125,9 @@ func resolveAndValidatePath(baseDir, reqPath string) (string, error) {
 		return "", fmt.Errorf("scp access denied: directory traversal detected")
 	}
 
-	// Double check .bashbox.toml on host
-	if hostPath == filepath.Join(workHostDir, ".bashbox.toml") {
-		return "", fmt.Errorf("scp access denied: cannot access .bashbox.toml")
+	// Double check .sshbox.toml on host
+	if hostPath == filepath.Join(workHostDir, ".sshbox.toml") {
+		return "", fmt.Errorf("scp access denied: cannot access .sshbox.toml")
 	}
 
 	return hostPath, nil
@@ -244,8 +244,8 @@ func handleSCPSink(channel ssh.Channel, hostPath string, opts *scpOptions) error
 			size, _ := strconv.ParseInt(parts[1], 10, 64)
 			filename := filepath.Base(parts[2])
 
-			if filename == ".bashbox.toml" || filename == ".home" {
-				sendSCPError(channel, "access denied: cannot modify .bashbox.toml or .home via /work")
+			if filename == ".sshbox.toml" || filename == ".home" {
+				sendSCPError(channel, "access denied: cannot modify .sshbox.toml or .home via /work")
 				return fmt.Errorf("attempt to modify restricted file via scp: %s", filename)
 			}
 
@@ -383,9 +383,9 @@ func handleSCPSource(channel ssh.Channel, hostPath string, opts *scpOptions) err
 }
 
 func sendSCPFile(channel ssh.Channel, reader *bufio.Reader, path string, st os.FileInfo, opts *scpOptions) error {
-	if filepath.Base(path) == ".bashbox.toml" {
-		sendSCPError(channel, "access denied to .bashbox.toml")
-		return fmt.Errorf("access denied to .bashbox.toml")
+	if filepath.Base(path) == ".sshbox.toml" {
+		sendSCPError(channel, "access denied to .sshbox.toml")
+		return fmt.Errorf("access denied to .sshbox.toml")
 	}
 
 	if opts.preserve {
@@ -457,7 +457,7 @@ func sendSCPTree(channel ssh.Channel, reader *bufio.Reader, dirPath string, opts
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if name == ".bashbox.toml" || name == ".home" {
+		if name == ".sshbox.toml" || name == ".home" {
 			continue
 		}
 		childPath := filepath.Join(dirPath, name)

@@ -36,7 +36,7 @@ type Config struct {
 }
 
 func LoadOrInitConfig(dir string) (*Config, ssh.Signer, error) {
-	configPath := filepath.Join(dir, ".bashbox.toml")
+	configPath := filepath.Join(dir, ".sshbox.toml")
 
 	var cfg Config
 	var data []byte
@@ -211,7 +211,7 @@ func generateEd25519HostKey() (string, ssh.Signer, error) {
 
 func saveConfig(path string, cfg *Config) error {
 	var sb strings.Builder
-	sb.WriteString("# sshbox configuration (.bashbox.toml)\n\n")
+	sb.WriteString("# sshbox configuration (.sshbox.toml)\n\n")
 	sb.WriteString("# Accepted client public keys for SSH authentication\n")
 	if len(cfg.AuthorizedKeys) == 0 {
 		sb.WriteString("authorized_keys = [\n    # \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... user@host\"\n]\n\n")

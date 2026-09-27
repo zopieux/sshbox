@@ -20,7 +20,7 @@ import (
 func TestConfigLoadAndGenerate(t *testing.T) {
 	tempDir := t.TempDir()
 
-	// 1. Initial load should create .bashbox.toml with host key
+	// 1. Initial load should create .sshbox.toml with host key
 	cfg, signer, err := LoadOrInitConfig(tempDir)
 	if err != nil {
 		t.Fatalf("LoadOrInitConfig failed: %v", err)
@@ -32,7 +32,7 @@ func TestConfigLoadAndGenerate(t *testing.T) {
 		t.Fatal("expected non-empty host key")
 	}
 
-	configPath := filepath.Join(tempDir, ".bashbox.toml")
+	configPath := filepath.Join(tempDir, ".sshbox.toml")
 	content, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatalf("failed to read created config: %v", err)
@@ -65,7 +65,7 @@ bind = [
     "shared:/shared:rw",
 ]
 `
-	configPath := filepath.Join(tempDir, ".bashbox.toml")
+	configPath := filepath.Join(tempDir, ".sshbox.toml")
 	if err := os.WriteFile(configPath, []byte(tomlData), 0600); err != nil {
 		t.Fatalf("write toml: %v", err)
 	}
@@ -154,14 +154,14 @@ func TestResolveAndValidatePath(t *testing.T) {
 		{"work root", "/work", false},
 		{"work subfile", "/work/foo.txt", false},
 		{"relative file", "foo.txt", false},
-		{"home root", "/home/bashbox", false},
-		{"home subfile", "/home/bashbox/test.txt", false},
+		{"home root", "/home/sshbox", false},
+		{"home subfile", "/home/sshbox/test.txt", false},
 		{"etc passwd", "/etc/passwd", true},
 		{"root dir", "/", false}, // defaults to /work
 		{"directory traversal 1", "/work/../etc/passwd", true},
-		{"directory traversal 2", "/home/bashbox/../../etc/passwd", true},
-		{"bashbox toml in work", "/work/.bashbox.toml", true},
-		{"bashbox toml subpath", "/work/.bashbox.toml/sub", true},
+		{"directory traversal 2", "/home/sshbox/../../etc/passwd", true},
+		{"sshbox toml in work", "/work/.sshbox.toml", true},
+		{"sshbox toml subpath", "/work/.sshbox.toml/sub", true},
 		{"home via work", "/work/.home", true},
 		{"home subfile via work", "/work/.home/secret", true},
 	}
@@ -232,7 +232,7 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 		t.Fatalf("mkdir shared_src: %v", err)
 	}
 
-	// Write .bashbox.toml with authorized key and custom binds
+	// Write .sshbox.toml with authorized key and custom binds
 	tomlBytes, err := toml.Marshal(&Config{
 		AuthorizedKeys: []string{authKeyLine},
 		Bind: []string{
@@ -241,10 +241,10 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("marshal .bashbox.toml: %v", err)
+		t.Fatalf("marshal .sshbox.toml: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(workDir, ".bashbox.toml"), tomlBytes, 0600); err != nil {
-		t.Fatalf("write .bashbox.toml: %v", err)
+	if err := os.WriteFile(filepath.Join(workDir, ".sshbox.toml"), tomlBytes, 0600); err != nil {
+		t.Fatalf("write .sshbox.toml: %v", err)
 	}
 
 	// Setup Unix domain socket for the server
@@ -277,7 +277,7 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 			return nil, err
 		}
 		clientCfg := &ssh.ClientConfig{
-			User:            "bashbox",
+			User:            "sshbox",
 			Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
 			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 			Timeout:         5 * time.Second,
@@ -337,17 +337,17 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 		if !strings.Contains(outStr, "PWD=/work") {
 			t.Errorf("expected PWD=/work, got output: %s", outStr)
 		}
-		if !strings.Contains(outStr, "USER=bashbox") {
-			t.Errorf("expected USER=bashbox, got output: %s", outStr)
+		if !strings.Contains(outStr, "USER=sshbox") {
+			t.Errorf("expected USER=sshbox, got output: %s", outStr)
 		}
-		if !strings.Contains(outStr, "HOME=/home/bashbox") {
-			t.Errorf("expected HOME=/home/bashbox, got output: %s", outStr)
+		if !strings.Contains(outStr, "HOME=/home/sshbox") {
+			t.Errorf("expected HOME=/home/sshbox, got output: %s", outStr)
 		}
 	})
 
 	t.Run("BubblewrapTomlShadowingAndProtection", func(t *testing.T) {
 		checkBwrap(t)
-		// Verify /work/.bashbox.toml cannot be read (content is masked to empty)
+		// Verify /work/.sshbox.toml cannot be read (content is masked to empty)
 		{
 			session, err := client.NewSession()
 			if err != nil {
@@ -355,16 +355,16 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 			}
 			defer session.Close()
 
-			out, err := session.CombinedOutput("cat /work/.bashbox.toml")
+			out, err := session.CombinedOutput("cat /work/.sshbox.toml")
 			if err != nil {
-				t.Fatalf("read /work/.bashbox.toml failed: %v", err)
+				t.Fatalf("read /work/.sshbox.toml failed: %v", err)
 			}
 			if len(out) != 0 {
-				t.Errorf("expected /work/.bashbox.toml to be empty (shadowed), but got: %q", string(out))
+				t.Errorf("expected /work/.sshbox.toml to be empty (shadowed), but got: %q", string(out))
 			}
 		}
 
-		// Verify /work/.bashbox.toml cannot be modified (Read-only)
+		// Verify /work/.sshbox.toml cannot be modified (Read-only)
 		{
 			session, err := client.NewSession()
 			if err != nil {
@@ -372,9 +372,9 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 			}
 			defer session.Close()
 
-			err = session.Run("echo 'hacked' >> /work/.bashbox.toml")
+			err = session.Run("echo 'hacked' >> /work/.sshbox.toml")
 			if err == nil {
-				t.Errorf("expected write to /work/.bashbox.toml to fail, but succeeded")
+				t.Errorf("expected write to /work/.sshbox.toml to fail, but succeeded")
 			}
 		}
 	})
@@ -418,7 +418,7 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 			}
 		}
 
-		// Verify /home/bashbox CAN access the real home files
+		// Verify /home/sshbox CAN access the real home files
 		{
 			session, err := client.NewSession()
 			if err != nil {
@@ -426,9 +426,9 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 			}
 			defer session.Close()
 
-			out, err := session.CombinedOutput("cat /home/bashbox/secret.txt")
+			out, err := session.CombinedOutput("cat /home/sshbox/secret.txt")
 			if err != nil {
-				t.Fatalf("read /home/bashbox/secret.txt failed: %v, out: %s", err, string(out))
+				t.Fatalf("read /home/sshbox/secret.txt failed: %v, out: %s", err, string(out))
 			}
 			if strings.TrimSpace(string(out)) != "hidden_content" {
 				t.Errorf("expected hidden_content, got: %q", string(out))
@@ -632,7 +632,7 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 		_ = session.Wait()
 	})
 
-	t.Run("SCPSinkUploadToHomeBashbox", func(t *testing.T) {
+	t.Run("SCPSinkUploadToHomeSshbox", func(t *testing.T) {
 		session, err := client.NewSession()
 		if err != nil {
 			t.Fatalf("NewSession: %v", err)
@@ -648,7 +648,7 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 			t.Fatalf("StdoutPipe: %v", err)
 		}
 
-		if err := session.Start("scp -t /home/bashbox/home_config.json"); err != nil {
+		if err := session.Start("scp -t /home/sshbox/home_config.json"); err != nil {
 			t.Fatalf("Start scp: %v", err)
 		}
 
@@ -685,11 +685,11 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 
 	t.Run("SCPSecurityRejectionPaths", func(t *testing.T) {
 		badPaths := []string{
-			"/work/.bashbox.toml",
+			"/work/.sshbox.toml",
 			"/work/.home",
 			"/etc/passwd",
 			"/work/../outside.txt",
-			"/home/bashbox/../../etc/shadow",
+			"/home/sshbox/../../etc/shadow",
 		}
 
 		for _, p := range badPaths {
