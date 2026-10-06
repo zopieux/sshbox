@@ -143,12 +143,17 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 		"--proc", "/proc",
 		"--ro-bind-try", "/sys", "/sys",
 		"--tmpfs", "/tmp",
-		"--ro-bind", "/nix/store", "/nix/store",
+		"--ro-bind-try", "/nix/store", "/nix/store",
 		"--ro-bind-try", "/nix/var", "/nix/var",
 		"--ro-bind-try", "/run/current-system", "/run/current-system",
 		"--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve",
 		"--ro-bind-try", "/bin", "/bin",
 		"--ro-bind-try", "/usr/bin", "/usr/bin",
+		"--ro-bind-try", "/lib", "/lib",
+		"--ro-bind-try", "/lib64", "/lib64",
+		"--ro-bind-try", "/usr/lib", "/usr/lib",
+		"--ro-bind-try", "/usr/lib64", "/usr/lib64",
+		"--ro-bind-try", "/usr/share", "/usr/share",
 		"--ro-bind-try", "/.host-etc", "/.host-etc",
 		"--tmpfs", "/etc",
 		"--perms", "0444", "--bind-data", "3", "/etc/passwd",
@@ -194,15 +199,70 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 		"--setenv", "SHELL", "/bin/sh",
 		"--setenv", "TMPDIR", "/tmp",
 		"--setenv", "TERM", term,
-		"--setenv", "COLORTERM", os.Getenv("COLORTERM"),
 		"--setenv", "LANG", "C.UTF-8",
-		"--setenv", "SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt",
-		"--setenv", "NIX_SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt",
-		"--setenv", "NIX_PATH", os.Getenv("NIX_PATH"),
 		"--setenv", "PATH", pathEnv,
-		"--setenv", "NIX_CONFIG", "extra-experimental-features = nix-command flakes",
-		"--unshare-all",
 	)
+
+	if colorTerm := os.Getenv("COLORTERM"); colorTerm != "" {
+		args = append(args, "--setenv", "COLORTERM", colorTerm)
+	}
+
+	hasNix := false
+	if _, err := os.Stat("/nix/store"); err == nil {
+		hasNix = true
+	} else if sCtx.PackageBinPath != "" {
+		hasNix = true
+	} else if _, err := exec.LookPath("nix"); err == nil {
+		hasNix = true
+	}
+
+	// SSL certificates
+	sslCertFile := os.Getenv("SSL_CERT_FILE")
+	if sslCertFile == "" {
+		for _, certPath := range []string{
+			"/etc/ssl/certs/ca-bundle.crt",
+			"/etc/ssl/certs/ca-certificates.crt",
+			"/etc/pki/tls/certs/ca-bundle.crt",
+		} {
+			if _, err := os.Stat(certPath); err == nil {
+				sslCertFile = certPath
+				break
+			}
+		}
+	}
+	if sslCertFile != "" {
+		args = append(args, "--setenv", "SSL_CERT_FILE", sslCertFile)
+	}
+
+	// Nix-specific environment variables: only set if non-empty or when Nix is present
+	if hasNix {
+		nixSSLCert := os.Getenv("NIX_SSL_CERT_FILE")
+		if nixSSLCert == "" {
+			nixSSLCert = sslCertFile
+		}
+		if nixSSLCert != "" {
+			args = append(args, "--setenv", "NIX_SSL_CERT_FILE", nixSSLCert)
+		}
+
+		nixConfig := os.Getenv("NIX_CONFIG")
+		if nixConfig == "" {
+			nixConfig = "extra-experimental-features = nix-command flakes"
+		}
+		args = append(args, "--setenv", "NIX_CONFIG", nixConfig)
+	} else {
+		if nixSSLCert := os.Getenv("NIX_SSL_CERT_FILE"); nixSSLCert != "" {
+			args = append(args, "--setenv", "NIX_SSL_CERT_FILE", nixSSLCert)
+		}
+		if nixConfig := os.Getenv("NIX_CONFIG"); nixConfig != "" {
+			args = append(args, "--setenv", "NIX_CONFIG", nixConfig)
+		}
+	}
+
+	if nixPath := os.Getenv("NIX_PATH"); nixPath != "" {
+		args = append(args, "--setenv", "NIX_PATH", nixPath)
+	}
+
+	args = append(args, "--unshare-all")
 
 	if sCtx.EnableNet {
 		args = append(args, "--share-net")
