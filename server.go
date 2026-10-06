@@ -1,13 +1,16 @@
 package sshbox
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -38,13 +41,14 @@ type envMsg struct {
 }
 
 type Server struct {
-	Config    *Config
-	SSHConfig *ssh.ServerConfig
-	WorkDir   string
-	Verbose   bool
-	EnableSCP bool
-	EnableGPU bool
-	EnableNet bool
+	Config        *Config
+	SSHConfig     *ssh.ServerConfig
+	WorkDir       string
+	Verbose       bool
+	EnableSCP     bool
+	EnableGPU     bool
+	EnableNet     bool
+	EnableForward bool
 }
 
 type ServerOption func(*Server)
@@ -63,6 +67,10 @@ func WithGPU(enable bool) ServerOption {
 
 func WithNet(enable bool) ServerOption {
 	return func(s *Server) { s.EnableNet = enable }
+}
+
+func WithForward(enable bool) ServerOption {
+	return func(s *Server) { s.EnableForward = enable }
 }
 
 func NewServer(workDir string, opts ...ServerOption) (*Server, error) {
@@ -89,6 +97,9 @@ func NewServer(workDir string, opts ...ServerOption) (*Server, error) {
 	}
 	if cfg.Net != nil {
 		srv.EnableNet = *cfg.Net
+	}
+	if cfg.Forward != nil {
+		srv.EnableForward = *cfg.Forward
 	}
 
 	for _, opt := range opts {
@@ -168,7 +179,14 @@ func handleConn(tcpConn net.Conn, srv *Server) {
 	defer serverConn.Close()
 
 	log.Printf("Connection established from %s (user: %q)", serverConn.RemoteAddr(), serverConn.User())
-	go ssh.DiscardRequests(reqs)
+
+	if srv.EnableForward {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go handleGlobalRequests(ctx, serverConn, reqs, srv)
+	} else {
+		go ssh.DiscardRequests(reqs)
+	}
 
 	for newChannel := range chans {
 		if newChannel.ChannelType() != "session" {
@@ -341,4 +359,237 @@ func tokenizeCommand(cmd string) []string {
 		args = append(args, current.String())
 	}
 	return args
+}
+
+type tcpipForwardMsg struct {
+	BindAddr string
+	BindPort uint32
+}
+
+type tcpipForwardSuccessMsg struct {
+	BindPort uint32
+}
+
+type forwardedTCPPayload struct {
+	Addr       string
+	Port       uint32
+	OriginAddr string
+	OriginPort uint32
+}
+
+func forwardKey(addr string, port uint32) string {
+	return fmt.Sprintf("%s:%d", addr, port)
+}
+
+func formatHostPort(addr string, port uint32) string {
+	if strings.HasPrefix(addr, "[") && strings.HasSuffix(addr, "]") {
+		return fmt.Sprintf("%s:%d", addr, port)
+	}
+	if strings.Contains(addr, ":") && !strings.HasPrefix(addr, "[") {
+		return fmt.Sprintf("[%s]:%d", addr, port)
+	}
+	return fmt.Sprintf("%s:%d", addr, port)
+}
+
+func handleGlobalRequests(ctx context.Context, serverConn *ssh.ServerConn, reqs <-chan *ssh.Request, srv *Server) {
+	var mu sync.Mutex
+	listeners := make(map[string][]net.Listener)
+
+	closeAll := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		closed := make(map[net.Listener]bool)
+		for _, list := range listeners {
+			for _, l := range list {
+				if !closed[l] {
+					closed[l] = true
+					_ = l.Close()
+				}
+			}
+		}
+		listeners = make(map[string][]net.Listener)
+	}
+
+	defer closeAll()
+
+	go func() {
+		<-ctx.Done()
+		closeAll()
+	}()
+
+	for req := range reqs {
+		switch req.Type {
+		case "tcpip-forward":
+			var msg tcpipForwardMsg
+			if err := ssh.Unmarshal(req.Payload, &msg); err != nil {
+				_ = req.Reply(false, nil)
+				continue
+			}
+
+			// Enforce security: only localhost/127.0.0.1/loopback is permitted to prevent
+			// using the jail or forwarded ports to escape or expose the local network.
+			var bindAddrs []string
+			switch msg.BindAddr {
+			case "", "localhost":
+				bindAddrs = []string{"127.0.0.1", "[::1]"}
+			case "127.0.0.1":
+				bindAddrs = []string{"127.0.0.1"}
+			case "::1", "[::1]":
+				bindAddrs = []string{"[::1]"}
+			default:
+				if srv.Verbose {
+					log.Printf("Rejected remote forward on non-localhost address %q (only localhost/127.0.0.1 allowed)", msg.BindAddr)
+				}
+				_ = req.Reply(false, nil)
+				continue
+			}
+
+			var opened []net.Listener
+			allocatedPort := msg.BindPort
+
+			for _, addr := range bindAddrs {
+				hostPort := formatHostPort(addr, allocatedPort)
+				l, err := net.Listen("tcp", hostPort)
+				if err != nil {
+					if len(opened) > 0 {
+						continue
+					}
+					continue
+				}
+
+				if allocatedPort == 0 {
+					if tcpAddr, ok := l.Addr().(*net.TCPAddr); ok {
+						allocatedPort = uint32(tcpAddr.Port)
+					}
+				}
+				opened = append(opened, l)
+			}
+
+			if len(opened) == 0 {
+				if srv.Verbose {
+					log.Printf("Failed to bind remote forward on %s:%d", msg.BindAddr, msg.BindPort)
+				}
+				_ = req.Reply(false, nil)
+				continue
+			}
+
+			for _, l := range opened {
+				if srv.Verbose {
+					log.Printf("Remote forward listening on %s (allocated port %d)", l.Addr(), allocatedPort)
+				}
+				go acceptForwardedConn(serverConn, l, msg.BindAddr, allocatedPort, srv.Verbose)
+			}
+
+			key := forwardKey(msg.BindAddr, msg.BindPort)
+			mu.Lock()
+			listeners[key] = append(listeners[key], opened...)
+			if msg.BindPort == 0 && allocatedPort != 0 {
+				allocKey := forwardKey(msg.BindAddr, allocatedPort)
+				listeners[allocKey] = append(listeners[allocKey], opened...)
+			}
+			mu.Unlock()
+
+			var replyPayload []byte
+			if msg.BindPort == 0 {
+				replyPayload = ssh.Marshal(&tcpipForwardSuccessMsg{BindPort: allocatedPort})
+			}
+			_ = req.Reply(true, replyPayload)
+
+		case "cancel-tcpip-forward":
+			var msg tcpipForwardMsg
+			if err := ssh.Unmarshal(req.Payload, &msg); err != nil {
+				_ = req.Reply(false, nil)
+				continue
+			}
+
+			key := forwardKey(msg.BindAddr, msg.BindPort)
+			mu.Lock()
+			list, ok := listeners[key]
+			if ok {
+				delete(listeners, key)
+				for _, l := range list {
+					_ = l.Close()
+				}
+			}
+			mu.Unlock()
+
+			if srv.Verbose {
+				log.Printf("Cancelled remote forward on %s:%d (found: %v)", msg.BindAddr, msg.BindPort, ok)
+			}
+			_ = req.Reply(ok, nil)
+
+		default:
+			_ = req.Reply(false, nil)
+		}
+	}
+}
+
+func acceptForwardedConn(serverConn *ssh.ServerConn, l net.Listener, bindAddr string, boundPort uint32, verbose bool) {
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			return
+		}
+		go forwardTCPConn(serverConn, conn, bindAddr, boundPort, verbose)
+	}
+}
+
+func forwardTCPConn(serverConn *ssh.ServerConn, localConn net.Conn, bindAddr string, boundPort uint32, verbose bool) {
+	defer localConn.Close()
+
+	connectedAddr := bindAddr
+	if connectedAddr == "" {
+		if tcpAddr, ok := localConn.LocalAddr().(*net.TCPAddr); ok {
+			connectedAddr = tcpAddr.IP.String()
+		} else {
+			connectedAddr = "127.0.0.1"
+		}
+	}
+
+	originIP := "127.0.0.1"
+	var originPort uint32 = 0
+	if tcpAddr, ok := localConn.RemoteAddr().(*net.TCPAddr); ok {
+		originIP = tcpAddr.IP.String()
+		originPort = uint32(tcpAddr.Port)
+	}
+
+	payload := ssh.Marshal(&forwardedTCPPayload{
+		Addr:       connectedAddr,
+		Port:       boundPort,
+		OriginAddr: originIP,
+		OriginPort: originPort,
+	})
+
+	channel, reqs, err := serverConn.OpenChannel("forwarded-tcpip", payload)
+	if err != nil {
+		if verbose {
+			log.Printf("Failed to open forwarded-tcpip channel to client: %v", err)
+		}
+		return
+	}
+	defer channel.Close()
+	go ssh.DiscardRequests(reqs)
+
+	if verbose {
+		log.Printf("Forwarding connection from %s to client via forwarded-tcpip (port %d)", localConn.RemoteAddr(), boundPort)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(channel, localConn)
+		_ = channel.CloseWrite()
+	}()
+
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(localConn, channel)
+		if tc, ok := localConn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+	}()
+
+	wg.Wait()
 }

@@ -32,6 +32,7 @@ type Config struct {
 	SCP            *bool    `toml:"scp,omitempty"`
 	GPU            *bool    `toml:"gpu,omitempty"`
 	Net            *bool    `toml:"net,omitempty"`
+	Forward        *bool    `toml:"forward,omitempty"`
 
 	ParsedBinds      []BindMount     `toml:"-"`
 	PackageBinPath   string          `toml:"-"`

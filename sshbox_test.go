@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -142,7 +143,6 @@ func TestNixPackageValidation(t *testing.T) {
 		}
 	}
 }
-
 
 func TestTokenizeCommand(t *testing.T) {
 	cmd := `scp -r -p "/work/my file.txt" '/work/another dir'`
@@ -469,6 +469,7 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 
 	// 3. Test SCP Protocol Handling & Security Restrictions
 	t.Run("SCPSinkUploadToWork", func(t *testing.T) {
+		checkBwrap(t)
 		session, err := client.NewSession()
 		if err != nil {
 			t.Fatalf("NewSession: %v", err)
@@ -527,6 +528,7 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 	})
 
 	t.Run("SCPSourceDownloadFromWork", func(t *testing.T) {
+		checkBwrap(t)
 		testData := "data_to_download\n"
 		testFile := filepath.Join(workDir, "download_test.txt")
 		if err := os.WriteFile(testFile, []byte(testData), 0644); err != nil {
@@ -598,6 +600,7 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 	})
 
 	t.Run("SCPSinkUploadToHomeSshbox", func(t *testing.T) {
+		checkBwrap(t)
 		session, err := client.NewSession()
 		if err != nil {
 			t.Fatalf("NewSession: %v", err)
@@ -649,6 +652,7 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 	})
 
 	t.Run("SCPSecurityRejectionPaths", func(t *testing.T) {
+		checkBwrap(t)
 		badPaths := []string{
 			"/work/.sshbox.toml",
 			"/work/.home",
@@ -851,4 +855,314 @@ func TestSSHServerRealWorldIntegration(t *testing.T) {
 		_ = bad1
 		_ = bad2
 	})
+
+	t.Run("ForwardDisabledByDefault", func(t *testing.T) {
+		l, err := client.Listen("tcp", "127.0.0.1:0")
+		if err == nil {
+			l.Close()
+			t.Fatal("expected remote port forwarding to fail when forward is disabled, but client.Listen succeeded")
+		}
+	})
+}
+
+func TestRemotePortForwarding(t *testing.T) {
+	workDir := t.TempDir()
+
+	authPub, authPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	authSSHPub, err := ssh.NewPublicKey(authPub)
+	if err != nil {
+		t.Fatalf("ssh.NewPublicKey: %v", err)
+	}
+	authKeyLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(authSSHPub)))
+
+	forwardTrue := true
+	tomlBytes, err := toml.Marshal(&Config{
+		AuthorizedKeys: []string{authKeyLine},
+		Forward:        &forwardTrue,
+	})
+	if err != nil {
+		t.Fatalf("marshal toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, ".sshbox.toml"), tomlBytes, 0600); err != nil {
+		t.Fatalf("write toml: %v", err)
+	}
+
+	sockDir := t.TempDir()
+	sockPath := filepath.Join(sockDir, "sshbox-fwd.sock")
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen unix socket: %v", err)
+	}
+	defer listener.Close()
+
+	server, err := NewServer(workDir, WithForward(true))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if !server.EnableForward {
+		t.Fatal("expected server.EnableForward to be true")
+	}
+
+	go func() {
+		_ = server.Serve(listener)
+	}()
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial server: %v", err)
+	}
+	signer, err := ssh.NewSignerFromKey(authPriv)
+	if err != nil {
+		t.Fatalf("signer: %v", err)
+	}
+	clientCfg := &ssh.ClientConfig{
+		User:            "sshbox",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	}
+	cConn, chans, reqs, err := ssh.NewClientConn(conn, sockPath, clientCfg)
+	if err != nil {
+		t.Fatalf("NewClientConn: %v", err)
+	}
+	client := ssh.NewClient(cConn, chans, reqs)
+	defer client.Close()
+
+	// 1. Request remote port forward (simulating ssh -R :0:...)
+	remoteListener, err := client.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client.Listen failed: %v", err)
+	}
+	defer remoteListener.Close()
+
+	boundAddr := remoteListener.Addr().String()
+
+	// 2. Start mock remote service accepting connections from the tunnel
+	go func() {
+		for {
+			srvConn, err := remoteListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				n, err := c.Read(buf)
+				if err != nil {
+					return
+				}
+				// Echo with prefix
+				_, _ = c.Write(append([]byte("echo: "), buf[:n]...))
+			}(srvConn)
+		}
+	}()
+
+	// 3. Reverse-connect from the host machine to the bound port (simulating ssh -p <port> root@localhost)
+	hostConn, err := net.Dial("tcp", boundAddr)
+	if err != nil {
+		t.Fatalf("reverse-connect to %s failed: %v", boundAddr, err)
+	}
+	defer hostConn.Close()
+
+	msg := "hello reverse connect"
+	if _, err := hostConn.Write([]byte(msg)); err != nil {
+		t.Fatalf("write to tunnel: %v", err)
+	}
+
+	resp := make([]byte, 64)
+	n, err := hostConn.Read(resp)
+	if err != nil {
+		t.Fatalf("read from tunnel: %v", err)
+	}
+	expected := "echo: " + msg
+	if string(resp[:n]) != expected {
+		t.Fatalf("expected response %q, got %q", expected, string(resp[:n]))
+	}
+
+	// 4. Cancel the forward by closing remoteListener
+	if err := remoteListener.Close(); err != nil {
+		t.Fatalf("remoteListener.Close failed: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 5. Subsequent connection to the port should be refused
+	refusedConn, err := net.DialTimeout("tcp", boundAddr, 200*time.Millisecond)
+	if err == nil {
+		refusedConn.Close()
+		t.Fatalf("expected connection to %s to be refused after cancel, but succeeded", boundAddr)
+	}
+
+	// 6. Security: reject non-localhost bind addresses (e.g. 0.0.0.0, external IPs)
+	for _, badAddr := range []string{"0.0.0.0:0", "192.168.1.1:0", "10.0.0.1:0", "example.com:0"} {
+		badListener, err := client.Listen("tcp", badAddr)
+		if err == nil {
+			badListener.Close()
+			t.Fatalf("expected client.Listen on non-localhost %s to be rejected, but succeeded", badAddr)
+		}
+	}
+}
+
+func TestOpenSSHClientRealWorldRemoteForwarding(t *testing.T) {
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("openssh client (ssh) not found in PATH")
+	}
+
+	workDir := t.TempDir()
+
+	// 1. Generate client key
+	keyPath := filepath.Join(workDir, "id_ed25519")
+	pubKeyPath := keyPath + ".pub"
+	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-f", keyPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ssh-keygen failed: %v, out: %s", err, string(out))
+	}
+	pubBytes, err := os.ReadFile(pubKeyPath)
+	if err != nil {
+		t.Fatalf("read pubkey: %v", err)
+	}
+
+	// 2. Setup server config with authorized key and forward=true
+	forwardTrue := true
+	tomlBytes, err := toml.Marshal(&Config{
+		AuthorizedKeys: []string{strings.TrimSpace(string(pubBytes))},
+		Forward:        &forwardTrue,
+	})
+	if err != nil {
+		t.Fatalf("marshal toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, ".sshbox.toml"), tomlBytes, 0600); err != nil {
+		t.Fatalf("write toml: %v", err)
+	}
+
+	// 3. Start mock backend service on remote client machine
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen backend: %v", err)
+	}
+	defer backendListener.Close()
+	backendPort := backendListener.Addr().(*net.TCPAddr).Port
+
+	go func() {
+		for {
+			c, err := backendListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				buf := make([]byte, 1024)
+				n, err := conn.Read(buf)
+				if err != nil {
+					return
+				}
+				_, _ = conn.Write(append([]byte("backend: "), buf[:n]...))
+			}(c)
+		}
+	}()
+
+	// 4. Start sshbox server on an ephemeral TCP port
+	serverListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen server: %v", err)
+	}
+	defer serverListener.Close()
+	serverPort := serverListener.Addr().(*net.TCPAddr).Port
+
+	server, err := NewServer(workDir, WithForward(true), WithVerbose(true))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	go func() {
+		_ = server.Serve(serverListener)
+	}()
+
+	// Pick an available port for the reverse forward
+	testFwdL, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("find free port: %v", err)
+	}
+	fwdPort := testFwdL.Addr().(*net.TCPAddr).Port
+	testFwdL.Close()
+
+	// 5. Run OpenSSH client: ssh -N -R <fwdPort>:localhost:<backendPort> -p <serverPort> ...
+	sshArgs := []string{
+		"-F", "none",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "BatchMode=yes",
+		"-i", keyPath,
+		"-N",
+		"-R", fmt.Sprintf("%d:localhost:%d", fwdPort, backendPort),
+		"-p", fmt.Sprintf("%d", serverPort),
+		"sshbox@127.0.0.1",
+	}
+
+	sshCmd := exec.Command("ssh", sshArgs...)
+	var sshStderr bytes.Buffer
+	sshCmd.Stderr = &sshStderr
+	if err := sshCmd.Start(); err != nil {
+		t.Fatalf("failed to start ssh client: %v", err)
+	}
+	defer func() {
+		_ = sshCmd.Process.Kill()
+		_ = sshCmd.Wait()
+	}()
+
+	// Wait for the forward port to become active on the server
+	var clientConn net.Conn
+	var dialErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		clientConn, dialErr = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", fwdPort))
+		if dialErr == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if dialErr != nil {
+		t.Fatalf("timed out connecting to forwarded port %d: %v (ssh stderr: %s)", fwdPort, dialErr, sshStderr.String())
+	}
+	defer clientConn.Close()
+
+	// 6. Test bidirectional communication through the reverse tunnel
+	reqMsg := "ping from reverse connect"
+	if _, err := clientConn.Write([]byte(reqMsg)); err != nil {
+		t.Fatalf("write to tunnel: %v", err)
+	}
+	respBuf := make([]byte, 1024)
+	n, err := clientConn.Read(respBuf)
+	if err != nil {
+		t.Fatalf("read from tunnel: %v (ssh stderr: %s)", err, sshStderr.String())
+	}
+	expected := "backend: " + reqMsg
+	if string(respBuf[:n]) != expected {
+		t.Fatalf("expected %q, got %q", expected, string(respBuf[:n]))
+	}
+
+	// 7. Also test connecting over IPv6 localhost [::1] (matches user scenario ssh -p 2222 root@localhost)
+	if ipv6Conn, err := net.Dial("tcp", fmt.Sprintf("[::1]:%d", fwdPort)); err == nil {
+		defer ipv6Conn.Close()
+		reqMsg6 := "ping from ipv6 reverse connect"
+		if _, err := ipv6Conn.Write([]byte(reqMsg6)); err != nil {
+			t.Fatalf("write to ipv6 tunnel: %v", err)
+		}
+		respBuf6 := make([]byte, 1024)
+		n6, err := ipv6Conn.Read(respBuf6)
+		if err != nil {
+			t.Fatalf("read from ipv6 tunnel: %v (ssh stderr: %s)", err, sshStderr.String())
+		}
+		expected6 := "backend: " + reqMsg6
+		if string(respBuf6[:n6]) != expected6 {
+			t.Fatalf("expected %q, got %q", expected6, string(respBuf6[:n6]))
+		}
+	}
+
+	// Verify no OpenSSH warning was emitted in stderr
+	if strings.Contains(sshStderr.String(), "unknown listen_port") {
+		t.Fatalf("OpenSSH client warned about unknown listen_port: %s", sshStderr.String())
+	}
 }
