@@ -26,7 +26,7 @@
             pname = "sshbox";
             version = "0.1.0";
             src = ./.;
-            vendorHash = "sha256-Vacsi01sg89/UqIqhEMLKaqmEKarCNbv1nsNv0iohfA=";
+            vendorHash = "sha256-tZelT9Xb0mlVYjVwGKM+AsvYcz+qcyM1I7O5gkV5o+g=";
             subPackages = [ "cmd" ];
             checkFlags = [ "./..." ];
             nativeBuildInputs = [ pkgs.makeWrapper ];

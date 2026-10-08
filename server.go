@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os/exec"
 	"path/filepath"
@@ -49,6 +48,7 @@ type Server struct {
 	EnableGPU     bool
 	EnableNet     bool
 	EnableForward bool
+	Monitor       Monitor
 }
 
 type ServerOption func(*Server)
@@ -71,6 +71,10 @@ func WithNet(enable bool) ServerOption {
 
 func WithForward(enable bool) ServerOption {
 	return func(s *Server) { s.EnableForward = enable }
+}
+
+func WithMonitor(m Monitor) ServerOption {
+	return func(s *Server) { s.Monitor = m }
 }
 
 func NewServer(workDir string, opts ...ServerOption) (*Server, error) {
@@ -106,13 +110,17 @@ func NewServer(workDir string, opts ...ServerOption) (*Server, error) {
 		opt(srv)
 	}
 
+	if srv.Monitor == nil {
+		srv.Monitor = NewPlainMonitor(srv.Verbose)
+	}
+
 	sshConfig := &ssh.ServerConfig{
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			if cfg.Authenticate(key) {
-				log.Printf("Accepted public key authentication for user %q (%s)", conn.User(), key.Type())
+				srv.Monitor.Log("Accepted public key authentication for user %q (%s)", conn.User(), key.Type())
 				return nil, nil
 			}
-			log.Printf("Rejected authentication for user %q: public key not in .sshbox.toml", conn.User())
+			srv.Monitor.Log("Rejected authentication for user %q from %s: public key not in .sshbox.toml", conn.User(), conn.RemoteAddr())
 			return nil, fmt.Errorf("public key authentication failed")
 		},
 	}
@@ -120,7 +128,7 @@ func NewServer(workDir string, opts ...ServerOption) (*Server, error) {
 	srv.SSHConfig = sshConfig
 
 	fingerprint := ssh.FingerprintSHA256(hostSigner.PublicKey())
-	log.Printf("Host key fingerprint: %s", fingerprint)
+	srv.Monitor.Log("Host key fingerprint: %s", fingerprint)
 
 	pkgs := cfg.Packages
 	if srv.EnableSCP {
@@ -139,7 +147,7 @@ func NewServer(workDir string, opts ...ServerOption) (*Server, error) {
 	if len(pkgs) > 0 {
 		binPath, err := BuildNixEnv(pkgs)
 		if err != nil {
-			log.Printf("Warning: failed to build nix packages environment: %v", err)
+			srv.Monitor.Log("Warning: failed to build nix packages environment: %v", err)
 			if srv.EnableSCP && cfg.PackageBinPath == "" {
 				if hostSCP, err := exec.LookPath("scp"); err == nil {
 					cfg.PackageBinPath = filepath.Dir(hostSCP)
@@ -147,7 +155,7 @@ func NewServer(workDir string, opts ...ServerOption) (*Server, error) {
 			}
 		} else if binPath != "" {
 			cfg.PackageBinPath = binPath
-			log.Printf("Nix environment prepared: %s", binPath)
+			srv.Monitor.Log("Nix environment prepared: %s", binPath)
 		}
 	} else if srv.EnableSCP {
 		if hostSCP, err := exec.LookPath("scp"); err == nil {
@@ -164,26 +172,29 @@ func (s *Server) Serve(listener net.Listener) error {
 		if err != nil {
 			return err
 		}
-		go handleConn(conn, s)
+		sess := s.Monitor.NewSession(conn.RemoteAddr().String())
+		go handleConn(conn, s, sess)
 	}
 }
 
-func handleConn(tcpConn net.Conn, srv *Server) {
+func handleConn(tcpConn net.Conn, srv *Server, sess SessionHandle) {
 	defer tcpConn.Close()
+	defer sess.Close()
 
 	serverConn, chans, reqs, err := ssh.NewServerConn(tcpConn, srv.SSHConfig)
 	if err != nil {
-		log.Printf("SSH handshake failed from %s: %v", tcpConn.RemoteAddr(), err)
+		sess.Log("SSH handshake failed: %v", err)
 		return
 	}
 	defer serverConn.Close()
 
-	log.Printf("Connection established from %s (user: %q)", serverConn.RemoteAddr(), serverConn.User())
+	sess.SetUser(serverConn.User())
+	sess.Log("Connection established (user: %q)", serverConn.User())
 
 	if srv.EnableForward {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		go handleGlobalRequests(ctx, serverConn, reqs, srv)
+		go handleGlobalRequests(ctx, serverConn, reqs, srv, sess)
 	} else {
 		go ssh.DiscardRequests(reqs)
 	}
@@ -196,15 +207,15 @@ func handleConn(tcpConn net.Conn, srv *Server) {
 
 		channel, requests, err := newChannel.Accept()
 		if err != nil {
-			log.Printf("Failed to accept session channel: %v", err)
+			sess.Log("Failed to accept session channel: %v", err)
 			return
 		}
 
-		go handleSession(channel, requests, srv)
+		go handleSession(channel, requests, srv, sess)
 	}
 }
 
-func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Server) {
+func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Server, sess SessionHandle) {
 	defer channel.Close()
 
 	winCh := make(chan WindowChange, 16)
@@ -227,6 +238,7 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Serve
 				sCtx.Term = msg.Term
 				sCtx.Cols = msg.Cols
 				sCtx.Rows = msg.Rows
+				sess.Log("Allocated PTY (%s, %dx%d)", msg.Term, msg.Cols, msg.Rows)
 				_ = req.Reply(true, nil)
 			} else {
 				_ = req.Reply(false, nil)
@@ -257,9 +269,8 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Serve
 
 		case "shell":
 			_ = req.Reply(true, nil)
-			if srv.Verbose {
-				log.Printf("Executing interactive shell in jail")
-			}
+			sess.SetType("shell")
+			sess.Log("Executing interactive shell in jail")
 			go func() {
 				for r := range requests {
 					if r.Type == "window-change" {
@@ -279,7 +290,9 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Serve
 				}
 			}()
 			if err := runInBwrap(channel, srv.WorkDir, sCtx); err != nil {
-				log.Printf("Bubblewrap interactive shell finished with error: %v", err)
+				sess.Log("Bubblewrap interactive shell exited with error: %v", err)
+			} else {
+				sess.Log("Bubblewrap interactive shell exited successfully")
 			}
 			return
 
@@ -291,20 +304,25 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Serve
 			}
 			_ = req.Reply(true, nil)
 
-			if srv.Verbose {
-				log.Printf("Executing command: %s", msg.Command)
-			}
-
 			cmdArgs := tokenizeCommand(msg.Command)
+			if len(cmdArgs) > 0 && cmdArgs[0] == "scp" {
+				sess.SetType("scp")
+			} else {
+				sess.SetType(fmt.Sprintf("exec: %s", msg.Command))
+			}
+			sess.Log("Executing command: %s", msg.Command)
+
 			if len(cmdArgs) > 0 && cmdArgs[0] == "scp" && !srv.EnableSCP {
-				log.Printf("SCP command rejected: scp is disabled (enable with --scp)")
+				sess.Log("SCP command rejected: scp is disabled (enable with --scp)")
 				sendExitStatus(channel, errors.New("scp is disabled on this server (enable with --scp)"))
 				return
 			}
 
 			sCtx.Command = msg.Command
 			if err := runInBwrap(channel, srv.WorkDir, sCtx); err != nil {
-				log.Printf("Bubblewrap exec command %q finished with error: %v", msg.Command, err)
+				sess.Log("Bubblewrap exec command %q exited with error: %v", msg.Command, err)
+			} else {
+				sess.Log("Bubblewrap exec command %q completed successfully", msg.Command)
 			}
 			return
 
@@ -391,7 +409,7 @@ func formatHostPort(addr string, port uint32) string {
 	return fmt.Sprintf("%s:%d", addr, port)
 }
 
-func handleGlobalRequests(ctx context.Context, serverConn *ssh.ServerConn, reqs <-chan *ssh.Request, srv *Server) {
+func handleGlobalRequests(ctx context.Context, serverConn *ssh.ServerConn, reqs <-chan *ssh.Request, srv *Server, sess SessionHandle) {
 	var mu sync.Mutex
 	listeners := make(map[string][]net.Listener)
 
@@ -437,9 +455,7 @@ func handleGlobalRequests(ctx context.Context, serverConn *ssh.ServerConn, reqs 
 			case "::1", "[::1]":
 				bindAddrs = []string{"[::1]"}
 			default:
-				if srv.Verbose {
-					log.Printf("Rejected remote forward on non-localhost address %q (only localhost/127.0.0.1 allowed)", msg.BindAddr)
-				}
+				sess.Log("Rejected remote forward on non-localhost address %q (only localhost/127.0.0.1 allowed)", msg.BindAddr)
 				_ = req.Reply(false, nil)
 				continue
 			}
@@ -466,18 +482,15 @@ func handleGlobalRequests(ctx context.Context, serverConn *ssh.ServerConn, reqs 
 			}
 
 			if len(opened) == 0 {
-				if srv.Verbose {
-					log.Printf("Failed to bind remote forward on %s:%d", msg.BindAddr, msg.BindPort)
-				}
+				sess.Log("Failed to bind remote forward on %s:%d", msg.BindAddr, msg.BindPort)
 				_ = req.Reply(false, nil)
 				continue
 			}
 
+			sess.SetType(fmt.Sprintf("fwd: %d", allocatedPort))
 			for _, l := range opened {
-				if srv.Verbose {
-					log.Printf("Remote forward listening on %s (allocated port %d)", l.Addr(), allocatedPort)
-				}
-				go acceptForwardedConn(serverConn, l, msg.BindAddr, allocatedPort, srv.Verbose)
+				sess.Log("Remote forward listening on %s (port %d)", l.Addr(), allocatedPort)
+				go acceptForwardedConn(serverConn, l, msg.BindAddr, allocatedPort, srv.Verbose, sess)
 			}
 
 			key := forwardKey(msg.BindAddr, msg.BindPort)
@@ -513,9 +526,7 @@ func handleGlobalRequests(ctx context.Context, serverConn *ssh.ServerConn, reqs 
 			}
 			mu.Unlock()
 
-			if srv.Verbose {
-				log.Printf("Cancelled remote forward on %s:%d (found: %v)", msg.BindAddr, msg.BindPort, ok)
-			}
+			sess.Log("Cancelled remote forward on %s:%d (found: %v)", msg.BindAddr, msg.BindPort, ok)
 			_ = req.Reply(ok, nil)
 
 		default:
@@ -524,17 +535,17 @@ func handleGlobalRequests(ctx context.Context, serverConn *ssh.ServerConn, reqs 
 	}
 }
 
-func acceptForwardedConn(serverConn *ssh.ServerConn, l net.Listener, bindAddr string, boundPort uint32, verbose bool) {
+func acceptForwardedConn(serverConn *ssh.ServerConn, l net.Listener, bindAddr string, boundPort uint32, verbose bool, sess SessionHandle) {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
 			return
 		}
-		go forwardTCPConn(serverConn, conn, bindAddr, boundPort, verbose)
+		go forwardTCPConn(serverConn, conn, bindAddr, boundPort, verbose, sess)
 	}
 }
 
-func forwardTCPConn(serverConn *ssh.ServerConn, localConn net.Conn, bindAddr string, boundPort uint32, verbose bool) {
+func forwardTCPConn(serverConn *ssh.ServerConn, localConn net.Conn, bindAddr string, boundPort uint32, verbose bool, sess SessionHandle) {
 	defer localConn.Close()
 
 	connectedAddr := bindAddr
@@ -562,17 +573,13 @@ func forwardTCPConn(serverConn *ssh.ServerConn, localConn net.Conn, bindAddr str
 
 	channel, reqs, err := serverConn.OpenChannel("forwarded-tcpip", payload)
 	if err != nil {
-		if verbose {
-			log.Printf("Failed to open forwarded-tcpip channel to client: %v", err)
-		}
+		sess.Log("Failed to open forwarded-tcpip channel to client: %v", err)
 		return
 	}
 	defer channel.Close()
 	go ssh.DiscardRequests(reqs)
 
-	if verbose {
-		log.Printf("Forwarding connection from %s to client via forwarded-tcpip (port %d)", localConn.RemoteAddr(), boundPort)
-	}
+	sess.Log("Forwarding connection from %s to client via forwarded-tcpip (port %d)", localConn.RemoteAddr(), boundPort)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
