@@ -224,6 +224,17 @@ func TestClientSessionCountAndHeader(t *testing.T) {
 	}
 
 	sess.Close()
+
+	// After closing, active client session count drops to 0
+	activeCount := 0
+	for _, s := range tui.sessions {
+		if s.ID != 0 && s.Active {
+			activeCount++
+		}
+	}
+	if activeCount != 0 {
+		t.Fatalf("expected 0 active client sessions after session closed, got %d", activeCount)
+	}
 }
 
 func TestScrollingDoesNothingWhenAllLinesFit(t *testing.T) {
@@ -249,6 +260,73 @@ func TestScrollingDoesNothingWhenAllLinesFit(t *testing.T) {
 	tui.scrollCurrentSessionToTop()
 	if sess.ScrollOffset != 0 || !sess.AutoScroll {
 		t.Fatalf("expected ScrollOffset=0 after scrollCurrentSessionToTop when all lines fit, got offset=%d", sess.ScrollOffset)
+	}
+}
+
+func TestCleanDeadSessions_FocusDeadLogsPane(t *testing.T) {
+	tui := NewTUI("/tmp", "127.0.0.1:2222")
+	sess1 := tui.NewSession("10.0.0.1:1234")
+
+	if len(tui.sessions) != 2 {
+		t.Fatalf("expected 2 sessions, got %d", len(tui.sessions))
+	}
+
+	// User focuses logs pane of the client session
+	tui.selectedIndex = 1
+	tui.activePane = PaneLogs
+
+	// Session terminates
+	sess1.Close()
+
+	// Trigger clean via key 'c'
+	tui.handleInput([]byte{'c'})
+
+	// Verify only main server session remains
+	if len(tui.sessions) != 1 {
+		t.Fatalf("expected 1 session after clean, got %d", len(tui.sessions))
+	}
+	if tui.sessions[0].ID != 0 {
+		t.Fatalf("expected server session at index 0, got ID %d", tui.sessions[0].ID)
+	}
+
+	// Verify navigated to main server in the left pane
+	if tui.selectedIndex != 0 {
+		t.Errorf("expected selectedIndex 0, got %d", tui.selectedIndex)
+	}
+	if tui.activePane != PaneSessions {
+		t.Errorf("expected activePane PaneSessions (left pane), got %v", tui.activePane)
+	}
+}
+
+func TestCleanDeadSessions_FocusActiveSession(t *testing.T) {
+	tui := NewTUI("/tmp", "127.0.0.1:2222")
+	sess1 := tui.NewSession("10.0.0.1:1234")
+	_ = tui.NewSession("10.0.0.2:5678")
+
+	if len(tui.sessions) != 3 {
+		t.Fatalf("expected 3 sessions, got %d", len(tui.sessions))
+	}
+
+	// Session 1 terminates, Session 2 is active
+	sess1.Close()
+
+	// User is focused in logs pane of active session 2 (index 2)
+	tui.selectedIndex = 2
+	tui.activePane = PaneLogs
+
+	// Clean dead sessions
+	tui.handleInput([]byte{'c'})
+
+	if len(tui.sessions) != 2 {
+		t.Fatalf("expected 2 sessions remaining, got %d", len(tui.sessions))
+	}
+	// Session 2 is now at index 1
+	if tui.selectedIndex != 1 {
+		t.Errorf("expected selectedIndex 1 for retained active session, got %d", tui.selectedIndex)
+	}
+	// Active pane remains logs pane because it was an active session
+	if tui.activePane != PaneLogs {
+		t.Errorf("expected activePane PaneLogs, got %v", tui.activePane)
 	}
 }
 

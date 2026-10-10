@@ -24,6 +24,7 @@ type BindMount struct {
 }
 
 type Config struct {
+	Port           *int     `toml:"port,omitempty"`
 	AuthorizedKeys []string `toml:"authorized_keys"`
 	AuthorizedKey  string   `toml:"authorized_key,omitempty"`
 	HostKey        string   `toml:"host_key"`
@@ -37,6 +38,29 @@ type Config struct {
 	ParsedBinds      []BindMount     `toml:"-"`
 	PackageBinPath   string          `toml:"-"`
 	parsedPublicKeys []ssh.PublicKey `toml:"-"`
+}
+
+func (c *Config) GetPort() int {
+	if c != nil && c.Port != nil && *c.Port > 0 {
+		return *c.Port
+	}
+	return 2222
+}
+
+func (c *Config) GetSCP() bool {
+	return c != nil && c.SCP != nil && *c.SCP
+}
+
+func (c *Config) GetGPU() bool {
+	return c != nil && c.GPU != nil && *c.GPU
+}
+
+func (c *Config) GetNet() bool {
+	return c != nil && c.Net != nil && *c.Net
+}
+
+func (c *Config) GetForward() bool {
+	return c != nil && c.Forward != nil && *c.Forward
 }
 
 func LoadOrInitConfig(dir string) (*Config, ssh.Signer, error) {
@@ -81,6 +105,10 @@ func LoadOrInitConfig(dir string) (*Config, ssh.Signer, error) {
 	}
 
 	if needSave {
+		if cfg.Port == nil {
+			defaultPort := 2222
+			cfg.Port = &defaultPort
+		}
 		if err := saveConfig(configPath, &cfg); err != nil {
 			return nil, nil, fmt.Errorf("save config %s: %w", configPath, err)
 		}
@@ -216,6 +244,22 @@ func generateEd25519HostKey() (string, ssh.Signer, error) {
 func saveConfig(path string, cfg *Config) error {
 	var sb strings.Builder
 	sb.WriteString("# sshbox configuration (.sshbox.toml)\n\n")
+	if cfg.Port != nil {
+		sb.WriteString(fmt.Sprintf("port = %d\n\n", *cfg.Port))
+	}
+	if cfg.SCP != nil {
+		sb.WriteString(fmt.Sprintf("scp = %t\n\n", *cfg.SCP))
+	}
+	if cfg.GPU != nil {
+		sb.WriteString(fmt.Sprintf("gpu = %t\n\n", *cfg.GPU))
+	}
+	if cfg.Net != nil {
+		sb.WriteString(fmt.Sprintf("net = %t\n\n", *cfg.Net))
+	}
+	if cfg.Forward != nil {
+		sb.WriteString(fmt.Sprintf("forward = %t\n\n", *cfg.Forward))
+	}
+
 	sb.WriteString("# Accepted client public keys for SSH authentication\n")
 	if len(cfg.AuthorizedKeys) == 0 {
 		sb.WriteString("authorized_keys = [\n    # \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... user@host\"\n]\n\n")

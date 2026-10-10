@@ -48,6 +48,7 @@ type Server struct {
 	EnableGPU     bool
 	EnableNet     bool
 	EnableForward bool
+	Port          int
 	Monitor       Monitor
 }
 
@@ -55,6 +56,10 @@ type ServerOption func(*Server)
 
 func WithVerbose(v bool) ServerOption {
 	return func(s *Server) { s.Verbose = v }
+}
+
+func WithPort(p int) ServerOption {
+	return func(s *Server) { s.Port = p }
 }
 
 func WithSCP(enable bool) ServerOption {
@@ -91,6 +96,7 @@ func NewServer(workDir string, opts ...ServerOption) (*Server, error) {
 	srv := &Server{
 		Config:  cfg,
 		WorkDir: absWorkDir,
+		Port:    cfg.GetPort(),
 	}
 
 	if cfg.SCP != nil {
@@ -173,6 +179,7 @@ func (s *Server) Serve(listener net.Listener) error {
 			return err
 		}
 		sess := s.Monitor.NewSession(conn.RemoteAddr().String())
+		sess.SetJail(s.WorkDir, s.Port)
 		go handleConn(conn, s, sess)
 	}
 }

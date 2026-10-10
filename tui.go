@@ -20,12 +20,20 @@ const (
 	PaneLogs     = 1
 )
 
+// JailInfo represents an active jail's root directory and port.
+type JailInfo struct {
+	WorkDir string
+	Port    int
+}
+
 // SessionInfo holds the monitoring state and logs for a session.
 type SessionInfo struct {
 	ID           int
 	RemoteAddr   string
 	User         string
 	Type         string
+	JailDir      string
+	JailPort     int
 	Active       bool
 	StartTime    time.Time
 	EndTime      time.Time
@@ -39,6 +47,7 @@ type SessionInfo struct {
 type TUI struct {
 	workDir        string
 	listenAddr     string
+	jails          []JailInfo
 	sessions       []*SessionInfo
 	serverSession  *SessionInfo
 	selectedIndex  int
@@ -51,6 +60,14 @@ type TUI struct {
 	closed         bool
 	nextID         int
 	onQuitCallback func()
+}
+
+// SetJails sets the list of managed jails for display in the TUI.
+func (t *TUI) SetJails(jails []JailInfo) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.jails = jails
+	t.triggerRender()
 }
 
 // NewTUI initializes a new TUI monitor.
@@ -223,6 +240,14 @@ func (h *tuiSessionHandle) SetType(typ string) {
 	h.t.triggerRender()
 }
 
+func (h *tuiSessionHandle) SetJail(workDir string, port int) {
+	h.info.mu.Lock()
+	h.info.JailDir = workDir
+	h.info.JailPort = port
+	h.info.mu.Unlock()
+	h.t.triggerRender()
+}
+
 func (h *tuiSessionHandle) Log(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	h.info.mu.Lock()
@@ -376,6 +401,11 @@ func (t *TUI) handleInput(b []byte) {
 			t.scrollCurrentSessionToBottom()
 			t.triggerRender()
 			return
+
+		case 'c', 'C', 'x', 'X', 'd', 'D': // Clean dead sessions
+			t.cleanDeadSessionsLocked()
+			t.triggerRender()
+			return
 		}
 	}
 
@@ -421,6 +451,62 @@ func (t *TUI) handleInput(b []byte) {
 	case seq == "\x1b[F" || seq == "\x1b[4~" || seq == "\x1b[8~": // End
 		t.scrollCurrentSessionToBottom()
 		t.triggerRender()
+	}
+}
+
+// CleanDeadSessions removes all terminated sessions from the TUI.
+// If the user was focused in the logs pane of a dead session, it navigates
+// to the always-there main server in the left pane.
+func (t *TUI) CleanDeadSessions() {
+	t.mu.Lock()
+	t.cleanDeadSessionsLocked()
+	t.mu.Unlock()
+	t.triggerRender()
+}
+
+func (t *TUI) cleanDeadSessionsLocked() {
+	if len(t.sessions) == 0 {
+		return
+	}
+
+	var currentSelected *SessionInfo
+	if t.selectedIndex >= 0 && t.selectedIndex < len(t.sessions) {
+		currentSelected = t.sessions[t.selectedIndex]
+	}
+
+	wasLogsPaneOfDead := false
+	if currentSelected != nil && t.activePane == PaneLogs && !currentSelected.Active && currentSelected.ID != 0 {
+		wasLogsPaneOfDead = true
+	}
+
+	var newSessions []*SessionInfo
+	for _, s := range t.sessions {
+		if s.ID == 0 || s.Active {
+			newSessions = append(newSessions, s)
+		}
+	}
+	t.sessions = newSessions
+
+	if wasLogsPaneOfDead {
+		t.selectedIndex = 0
+		t.activePane = PaneSessions
+	} else if currentSelected != nil {
+		found := false
+		for i, s := range t.sessions {
+			if s == currentSelected {
+				t.selectedIndex = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			if t.selectedIndex >= len(t.sessions) {
+				t.selectedIndex = len(t.sessions) - 1
+			}
+			if t.selectedIndex < 0 {
+				t.selectedIndex = 0
+			}
+		}
 	}
 }
 
@@ -614,30 +700,44 @@ func (t *TUI) render() {
 	cRev := "\x1b[7m"
 
 	// 1. Top Bar: Server summary
-	clientCount := 0
 	activeCount := 0
 	for _, s := range t.sessions {
-		if s.ID != 0 {
-			clientCount++
-			if s.Active {
-				activeCount++
-			}
+		if s.ID != 0 && s.Active {
+			activeCount++
 		}
 	}
-	topBarLeft := fmt.Sprintf(" %s%ssshbox%s │ Listen: %s%s%s │ Root: %s",
-		cBold, cCyan, cReset,
-		cWhite, t.listenAddr, cReset,
-		t.workDir,
-	)
-	topBarRight := fmt.Sprintf("Active: %s%d%s │ Total: %d ",
-		cGreen, activeCount, cReset, clientCount,
+
+	var topBarLeft string
+	if len(t.jails) > 1 {
+		var portStrs []string
+		for _, j := range t.jails {
+			portStrs = append(portStrs, fmt.Sprintf("%d", j.Port))
+		}
+		topBarLeft = fmt.Sprintf(" %s%ssshbox%s │ Jails: %d │ Ports: %s%s%s",
+			cBold, cCyan, cReset,
+			len(t.jails),
+			cWhite, strings.Join(portStrs, ", "), cReset,
+		)
+	} else {
+		topBarLeft = fmt.Sprintf(" %s%ssshbox%s │ Listen: %s%s%s │ Root: %s",
+			cBold, cCyan, cReset,
+			cWhite, t.listenAddr, cReset,
+			t.workDir,
+		)
+	}
+
+	topBarRight := fmt.Sprintf("Active: %s%d%s ",
+		cGreen, activeCount, cReset,
 	)
 	topSpaces := width - visibleWidth(topBarLeft) - visibleWidth(topBarRight)
 	if topSpaces < 1 {
 		topSpaces = 1
 	}
 	topLine := topBarLeft + strings.Repeat(" ", topSpaces) + topBarRight
-	buf.WriteString(cRev + padOrTruncate(topLine, width) + cReset + "\r\n")
+	buf.WriteString(cRev)
+	buf.WriteString(padOrTruncate(topLine, width))
+	buf.WriteString(cReset)
+	buf.WriteString("\r\n")
 
 	// 2. Panes Headers
 	leftFocused := (t.activePane == PaneSessions)
@@ -656,9 +756,9 @@ func (t *TUI) render() {
 		midBorderColor = cCyan
 	}
 
-	leftTitleText := fmt.Sprintf(" SESSIONS (%d) ", clientCount)
+	leftTitleText := fmt.Sprintf(" SESSIONS (%d) ", activeCount)
 	if leftFocused {
-		leftTitleText = fmt.Sprintf(" [SESSIONS (%d)] ", clientCount)
+		leftTitleText = fmt.Sprintf(" [SESSIONS (%d)] ", activeCount)
 	}
 	leftHeaderBar := "─" + cBold + cWhite + leftTitleText + leftBorderColor
 	leftFill := leftInnerW - 1 - visibleWidth(leftTitleText)
@@ -678,7 +778,16 @@ func (t *TUI) render() {
 
 	// Full top border of the grid:
 	// ┌ (1) + leftHeaderBar (leftInnerW) + ┬ (1) + rightHeaderBar (rightInnerW) + ┐ (1)
-	buf.WriteString(leftBorderColor + "┌" + leftHeaderBar + midBorderColor + "┬" + rightBorderColor + rightHeaderBar + "┐" + cReset + "\r\n")
+	buf.WriteString(leftBorderColor)
+	buf.WriteString("┌")
+	buf.WriteString(leftHeaderBar)
+	buf.WriteString(midBorderColor)
+	buf.WriteString("┬")
+	buf.WriteString(rightBorderColor)
+	buf.WriteString(rightHeaderBar)
+	buf.WriteString("┐")
+	buf.WriteString(cReset)
+	buf.WriteString("\r\n")
 
 	// Main body height (excluding top bar, header line, bottom border line, status bar)
 	bodyHeight := height - 3
@@ -709,7 +818,15 @@ func (t *TUI) render() {
 
 		if currentSession.ID == 0 {
 			rightDetailsLines[0] = fmt.Sprintf(" %sSession: [Server Host]%s │ Status: %s", cBold, cReset, statusStr)
-			rightDetailsLines[1] = fmt.Sprintf(" Sandbox Root: %s", t.workDir)
+			if len(t.jails) > 1 {
+				var jailStrs []string
+				for _, j := range t.jails {
+					jailStrs = append(jailStrs, fmt.Sprintf("%s(:%d)", filepath.Base(j.WorkDir), j.Port))
+				}
+				rightDetailsLines[1] = fmt.Sprintf(" Jails (%d): %s", len(t.jails), strings.Join(jailStrs, ", "))
+			} else {
+				rightDetailsLines[1] = fmt.Sprintf(" Sandbox Root: %s", t.workDir)
+			}
 		} else {
 			user := currentSession.User
 			if user == "" {
@@ -718,8 +835,16 @@ func (t *TUI) render() {
 			rightDetailsLines[0] = fmt.Sprintf(" %s#%d %s@%s%s │ Status: %s │ Type: %s%s%s",
 				cBold, currentSession.ID, user, currentSession.RemoteAddr, cReset,
 				statusStr, cCyan, currentSession.Type, cReset)
-			rightDetailsLines[1] = fmt.Sprintf(" Started: %s │ Sandbox Root: %s │ Logs: %d lines",
-				currentSession.StartTime.Format("15:04:05"), t.workDir, len(currentSession.Logs))
+			root := currentSession.JailDir
+			if root == "" {
+				root = t.workDir
+			}
+			portStr := ""
+			if currentSession.JailPort > 0 {
+				portStr = fmt.Sprintf(" │ Port: %d", currentSession.JailPort)
+			}
+			rightDetailsLines[1] = fmt.Sprintf(" Started: %s%s │ Sandbox Root: %s │ Logs: %d lines",
+				currentSession.StartTime.Format("15:04:05"), portStr, root, len(currentSession.Logs))
 		}
 		currentSession.mu.RUnlock()
 	} else {
@@ -792,6 +917,8 @@ func (t *TUI) render() {
 			var itemText string
 			if sess.ID == 0 {
 				itemText = fmt.Sprintf("%s [Server]", statusDot)
+			} else if sess.JailPort > 0 && len(t.jails) > 1 {
+				itemText = fmt.Sprintf("%s #%d %s [%s] :%d", statusDot, sess.ID, user, sess.Type, sess.JailPort)
 			} else {
 				itemText = fmt.Sprintf("%s #%d %s [%s]", statusDot, sess.ID, user, sess.Type)
 			}
@@ -830,11 +957,18 @@ func (t *TUI) render() {
 			rightPadded = padOrTruncate(content, rightInnerW)
 		}
 
-		buf.WriteString(leftBorderColor + "│" + cReset)
+		buf.WriteString(leftBorderColor)
+		buf.WriteString("│")
+		buf.WriteString(cReset)
 		buf.WriteString(leftPadded)
-		buf.WriteString(midBorderColor + midChar + cReset)
+		buf.WriteString(midBorderColor)
+		buf.WriteString(midChar)
+		buf.WriteString(cReset)
 		buf.WriteString(rightPadded)
-		buf.WriteString(rightBorderColor + rightBorderChar + cReset + "\r\n")
+		buf.WriteString(rightBorderColor)
+		buf.WriteString(rightBorderChar)
+		buf.WriteString(cReset)
+		buf.WriteString("\r\n")
 	}
 
 	// Bottom border of panes:
@@ -854,10 +988,19 @@ func (t *TUI) render() {
 		rightBottomBar = strings.Repeat("─", rightInnerW)
 	}
 
-	buf.WriteString(leftBorderColor + "└" + leftBottomBar + midBorderColor + "┴" + rightBorderColor + rightBottomBar + "┘" + cReset + "\r\n")
+	buf.WriteString(leftBorderColor)
+	buf.WriteString("└")
+	buf.WriteString(leftBottomBar)
+	buf.WriteString(midBorderColor)
+	buf.WriteString("┴")
+	buf.WriteString(rightBorderColor)
+	buf.WriteString(rightBottomBar)
+	buf.WriteString("┘")
+	buf.WriteString(cReset)
+	buf.WriteString("\r\n")
 
 	// 3. Status Bar (Keybindings & Hints)
-	statusText := fmt.Sprintf(" %s[Tab]%s Switch Pane  %s[↑/↓]%s %s  %s[PgUp/PgDn]%s Scroll Logs  %s[Home/End]%s Jump  %s[q]%s Quit",
+	statusText := fmt.Sprintf(" %s[Tab]%s Switch Pane  %s[↑/↓]%s %s  %s[PgUp/PgDn]%s Scroll Logs  %s[c]%s Clean  %s[q]%s Quit",
 		cBold, cReset,
 		cBold, cReset,
 		func() string {
@@ -870,7 +1013,9 @@ func (t *TUI) render() {
 		cBold, cReset,
 		cBold, cReset,
 	)
-	buf.WriteString(cRev + padOrTruncate(statusText, width) + cReset)
+	buf.WriteString(cRev)
+	buf.WriteString(padOrTruncate(statusText, width))
+	buf.WriteString(cReset)
 
 	_, _ = os.Stdout.Write(buf.Bytes())
 }

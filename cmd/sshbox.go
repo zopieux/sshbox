@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,39 +15,49 @@ import (
 )
 
 func main() {
-	var port int
 	var host string
-	var workDir string
 	var verbose bool
-	var enableSCP bool
-	var enableGPU bool
-	var enableNet bool
-	var enableForward bool
 	var noUI bool
 
-	flag.IntVar(&port, "p", 2222, "Port to listen on (default: 2222)")
-	flag.IntVar(&port, "port", 2222, "Port to listen on (default: 2222)")
 	flag.StringVar(&host, "host", "0.0.0.0", "Host/interface to listen on (default: 0.0.0.0)")
-	flag.StringVar(&workDir, "dir", ".", "Working directory to jail and serve (defaults to current directory)")
 	flag.BoolVar(&verbose, "v", false, "Log executed commands and detailed activity (default: disabled)")
 	flag.BoolVar(&verbose, "verbose", false, "Log executed commands and detailed activity (default: disabled)")
-	flag.BoolVar(&enableSCP, "scp", false, "Enable scp support inside the jail (default: disabled)")
-	flag.BoolVar(&enableGPU, "gpu", false, "Enable GPU and host /dev access inside the jail (default: disabled)")
-	flag.BoolVar(&enableNet, "net", false, "Enable network access inside the jail (default: disabled)")
-	flag.BoolVar(&enableForward, "forward", false, "Enable remote port forwarding (default: disabled)")
 	flag.BoolVar(&noUI, "no-ui", false, "Disable TUI monitoring and use plain logs (default: false)")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <dir> [dir...]\n", os.Args[0])
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
-	listenAddr := fmt.Sprintf("%s:%d", host, port)
-	listener, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		log.Fatalf("Failed to listen on %s: %v", listenAddr, err)
+	dirs := flag.Args()
+	if len(dirs) == 0 {
+		flag.Usage()
+		os.Exit(1)
 	}
-	defer listener.Close()
 
-	absWorkDir, err := filepath.Abs(workDir)
+	var absDirs []string
+	seen := make(map[string]bool)
+	for _, d := range dirs {
+		abs, err := filepath.Abs(d)
+		if err != nil {
+			log.Fatalf("Failed to resolve path %s: %v", d, err)
+		}
+		if !seen[abs] {
+			seen[abs] = true
+			absDirs = append(absDirs, abs)
+		}
+	}
+
+	// Validate port conflicts across all jail configs
+	conflicts, err := sshbox.CheckPortConflicts(absDirs)
 	if err != nil {
-		absWorkDir = workDir
+		log.Fatalf("Failed to load jail configs: %v", err)
+	}
+	if len(conflicts) > 0 {
+		for _, c := range conflicts {
+			fmt.Fprintf(os.Stderr, "Port conflict: %s\n", c.Error())
+		}
+		os.Exit(1)
 	}
 
 	useUI := !noUI && term.IsTerminal(int(os.Stdout.Fd())) && term.IsTerminal(int(os.Stdin.Fd()))
@@ -57,30 +66,24 @@ func main() {
 	var tui *sshbox.TUI
 
 	if useUI {
-		tui = sshbox.NewTUI(absWorkDir, listenAddr)
+		tui = sshbox.NewTUI(absDirs[0], "")
 		mon = tui
 	} else {
 		mon = sshbox.NewPlainMonitor(verbose)
 	}
 
-	srv, err := sshbox.NewServer(absWorkDir,
+	mgr, err := sshbox.NewManager(absDirs, mon,
 		sshbox.WithVerbose(verbose),
-		sshbox.WithSCP(enableSCP),
-		sshbox.WithGPU(enableGPU),
-		sshbox.WithNet(enableNet),
-		sshbox.WithForward(enableForward),
-		sshbox.WithMonitor(mon),
 	)
 	if err != nil {
 		if tui != nil {
 			tui.Close()
 		}
-		log.Fatalf("Failed to initialize server: %v", err)
+		log.Fatalf("Failed to initialize jails: %v", err)
 	}
 
-	mon.Log("sshbox listening on %s (sandboxed root: %s)", listenAddr, srv.WorkDir)
-
 	if useUI {
+		tui.SetJails(mgr.Jails())
 		if err := tui.Start(); err != nil {
 			log.Printf("Failed to start TUI, falling back to plain logs: %v", err)
 			useUI = false
@@ -92,7 +95,7 @@ func main() {
 
 	serverDone := make(chan error, 1)
 	go func() {
-		serverDone <- srv.Serve(listener)
+		serverDone <- mgr.Serve(host)
 	}()
 
 	if useUI {
@@ -104,10 +107,10 @@ func main() {
 				log.Printf("Server exited: %v", err)
 			}
 		case <-tui.QuitChan():
-			listener.Close()
+			mgr.Close()
 			tui.Close()
 		case <-sigCh:
-			listener.Close()
+			mgr.Close()
 			tui.Close()
 		}
 	} else {
@@ -117,7 +120,7 @@ func main() {
 				log.Printf("Server exited: %v", err)
 			}
 		case <-sigCh:
-			listener.Close()
+			mgr.Close()
 			log.Printf("Shutting down...")
 		}
 	}

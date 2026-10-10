@@ -18,6 +18,7 @@ type Monitor interface {
 type SessionHandle interface {
 	SetUser(user string)
 	SetType(typ string)
+	SetJail(workDir string, port int)
 	Log(format string, args ...any)
 	Close()
 }
@@ -55,6 +56,8 @@ type plainSessionHandle struct {
 	remoteAddr string
 	user       string
 	typ        string
+	workDir    string
+	port       int
 	verbose    bool
 	mu         sync.Mutex
 }
@@ -69,6 +72,13 @@ func (s *plainSessionHandle) SetType(typ string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.typ = typ
+}
+
+func (s *plainSessionHandle) SetJail(workDir string, port int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workDir = workDir
+	s.port = port
 }
 
 func (s *plainSessionHandle) Log(format string, args ...any) {
