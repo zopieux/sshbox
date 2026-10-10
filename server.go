@@ -48,8 +48,10 @@ type Server struct {
 	EnableGPU     bool
 	EnableNet     bool
 	EnableForward bool
+	OpenPortMode  OpenPortMode
 	Port          int
 	Monitor       Monitor
+	PortForwarder *PortForwarder
 }
 
 type ServerOption func(*Server)
@@ -76,6 +78,10 @@ func WithNet(enable bool) ServerOption {
 
 func WithForward(enable bool) ServerOption {
 	return func(s *Server) { s.EnableForward = enable }
+}
+
+func WithOpenPort(mode OpenPortMode) ServerOption {
+	return func(s *Server) { s.OpenPortMode = mode }
 }
 
 func WithMonitor(m Monitor) ServerOption {
@@ -111,6 +117,7 @@ func NewServer(workDir string, opts ...ServerOption) (*Server, error) {
 	if cfg.Forward != nil {
 		srv.EnableForward = *cfg.Forward
 	}
+	srv.OpenPortMode = cfg.GetOpenPortMode()
 
 	for _, opt := range opts {
 		opt(srv)
@@ -172,7 +179,27 @@ func NewServer(workDir string, opts ...ServerOption) (*Server, error) {
 	return srv, nil
 }
 
+func (s *Server) OpenPortForward() {
+	if s.OpenPortMode == OpenPortNone {
+		return
+	}
+	if s.PortForwarder == nil {
+		s.PortForwarder = NewPortForwarder(s.Port, s.OpenPortMode, s.Monitor)
+	}
+	s.PortForwarder.Open()
+}
+
+func (s *Server) ClosePortForward() {
+	if s.PortForwarder != nil {
+		s.PortForwarder.Close()
+	}
+}
+
 func (s *Server) Serve(listener net.Listener) error {
+	if s.OpenPortMode != OpenPortNone {
+		s.OpenPortForward()
+		defer s.ClosePortForward()
+	}
 	for {
 		conn, err := listener.Accept()
 		if err != nil {

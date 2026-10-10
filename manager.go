@@ -170,4 +170,7 @@ func (m *Manager) Close() {
 	for _, l := range m.Listeners {
 		_ = l.Close()
 	}
+	for _, s := range m.Servers {
+		s.ClosePortForward()
+	}
 }

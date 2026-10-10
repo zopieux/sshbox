@@ -34,11 +34,22 @@ type Config struct {
 	GPU            *bool    `toml:"gpu,omitempty"`
 	Net            *bool    `toml:"net,omitempty"`
 	Forward        *bool    `toml:"forward,omitempty"`
+	OpenPort       string   `toml:"open_port,omitempty"`
 
 	ParsedBinds      []BindMount     `toml:"-"`
 	PackageBinPath   string          `toml:"-"`
 	parsedPublicKeys []ssh.PublicKey `toml:"-"`
 }
+
+// OpenPortMode defines how the jail's port should be exposed externally.
+type OpenPortMode string
+
+const (
+	OpenPortNone     OpenPortMode = "none"
+	OpenPortFirewall OpenPortMode = "firewall"
+	OpenPortNatPMP   OpenPortMode = "natpmp"
+	OpenPortBoth     OpenPortMode = "both"
+)
 
 func (c *Config) GetPort() int {
 	if c != nil && c.Port != nil && *c.Port > 0 {
@@ -61,6 +72,32 @@ func (c *Config) GetNet() bool {
 
 func (c *Config) GetForward() bool {
 	return c != nil && c.Forward != nil && *c.Forward
+}
+
+func (c *Config) GetOpenPortMode() OpenPortMode {
+	if c == nil {
+		return OpenPortNone
+	}
+	switch strings.ToLower(strings.TrimSpace(c.OpenPort)) {
+	case "firewall":
+		return OpenPortFirewall
+	case "natpmp":
+		return OpenPortNatPMP
+	case "both":
+		return OpenPortBoth
+	default:
+		return OpenPortNone
+	}
+}
+
+func (c *Config) ShouldOpenFirewall() bool {
+	m := c.GetOpenPortMode()
+	return m == OpenPortFirewall || m == OpenPortBoth
+}
+
+func (c *Config) ShouldOpenNatPMP() bool {
+	m := c.GetOpenPortMode()
+	return m == OpenPortNatPMP || m == OpenPortBoth
 }
 
 func LoadOrInitConfig(dir string) (*Config, ssh.Signer, error) {
@@ -258,6 +295,9 @@ func saveConfig(path string, cfg *Config) error {
 	}
 	if cfg.Forward != nil {
 		sb.WriteString(fmt.Sprintf("forward = %t\n\n", *cfg.Forward))
+	}
+	if mode := cfg.GetOpenPortMode(); mode != OpenPortNone {
+		sb.WriteString(fmt.Sprintf("open_port = %q\n\n", mode))
 	}
 
 	sb.WriteString("# Accepted client public keys for SSH authentication\n")
