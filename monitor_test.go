@@ -1,6 +1,7 @@
 package sshbox
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -144,6 +145,95 @@ func TestTUIMonitorSessionsAndAutoscroll(t *testing.T) {
 	tui.handleInput([]byte{'k'}) // Prev
 	if tui.selectedIndex != 0 {
 		t.Errorf("expected selectedIndex=0 after 'k', got %d", tui.selectedIndex)
+	}
+}
+
+func TestTUIKillKey(t *testing.T) {
+	tui := NewTUI("/tmp/work", "0.0.0.0:2222")
+
+	// 1. On server pane (selectedIndex = 0), 'x' does nothing
+	tui.selectedIndex = 0
+	serverSess := tui.sessions[0]
+	initialLogs := len(serverSess.Logs)
+	tui.handleInput([]byte{'x'})
+	if !serverSess.Active {
+		t.Errorf("expected server session to remain active after 'x'")
+	}
+	if len(serverSess.Logs) != initialLogs {
+		t.Errorf("expected no logs on server session after 'x', got %d new logs", len(serverSess.Logs)-initialLogs)
+	}
+
+	// 2. On jailed (bwrap) process session, 'x' kills (-9) the process
+	sessHandle1 := tui.NewSession("10.0.0.1:12345")
+	sessHandle1.SetType("shell")
+	dummyCmd := exec.Command("sleep", "30")
+	if err := dummyCmd.Start(); err != nil {
+		t.Fatalf("start dummy sleep: %v", err)
+	}
+	defer func() {
+		_ = dummyCmd.Process.Kill()
+		_ = dummyCmd.Wait()
+	}()
+
+	sessHandle1.SetProcess(dummyCmd.Process)
+	tui.selectedIndex = 1 // session 1
+	tui.handleInput([]byte{'x'})
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- dummyCmd.Wait()
+	}()
+
+	select {
+	case err := <-waitDone:
+		if err == nil {
+			t.Errorf("expected process to be killed by SIGKILL, got nil error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("process was not terminated by 'x' key")
+	}
+
+	sess1 := tui.sessions[1]
+	sess1.mu.RLock()
+	foundKillLog := false
+	for _, l := range sess1.Logs {
+		if strings.Contains(l.Message, "Killed (-9) jailed process") {
+			foundKillLog = true
+			break
+		}
+	}
+	sess1.mu.RUnlock()
+	if !foundKillLog {
+		t.Errorf("expected log entry about killing process, got %+v", sess1.Logs)
+	}
+
+	// 3. On forward session, 'x' closes the session
+	sessHandle2 := tui.NewSession("10.0.0.2:12346")
+	sessHandle2.SetType("fwd: 8080")
+	closedCalled := false
+	sessHandle2.SetCloseFunc(func() {
+		closedCalled = true
+	})
+	tui.selectedIndex = 2 // session 2
+	tui.handleInput([]byte{'x'})
+
+	time.Sleep(50 * time.Millisecond)
+	if !closedCalled {
+		t.Errorf("expected closeFunc to be invoked on forward session when pressing 'x'")
+	}
+
+	sess2 := tui.sessions[2]
+	sess2.mu.RLock()
+	foundFwdCloseLog := false
+	for _, l := range sess2.Logs {
+		if strings.Contains(l.Message, "Forward session closed by operator") {
+			foundFwdCloseLog = true
+			break
+		}
+	}
+	sess2.mu.RUnlock()
+	if !foundFwdCloseLog {
+		t.Errorf("expected log entry about closing forward session, got %+v", sess2.Logs)
 	}
 }
 

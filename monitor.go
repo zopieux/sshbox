@@ -3,6 +3,7 @@ package sshbox
 import (
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 )
@@ -19,6 +20,8 @@ type SessionHandle interface {
 	SetUser(user string)
 	SetType(typ string)
 	SetJail(workDir string, port int)
+	SetProcess(proc *os.Process)
+	SetCloseFunc(fn func())
 	Log(format string, args ...any)
 	Close()
 }
@@ -80,6 +83,10 @@ func (s *plainSessionHandle) SetJail(workDir string, port int) {
 	s.workDir = workDir
 	s.port = port
 }
+
+func (s *plainSessionHandle) SetProcess(proc *os.Process) {}
+
+func (s *plainSessionHandle) SetCloseFunc(fn func()) {}
 
 func (s *plainSessionHandle) Log(format string, args ...any) {
 	s.mu.Lock()

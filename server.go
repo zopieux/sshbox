@@ -224,6 +224,10 @@ func handleConn(tcpConn net.Conn, srv *Server, sess SessionHandle) {
 
 	sess.SetUser(serverConn.User())
 	sess.Log("Connection established (user: %q)", serverConn.User())
+	sess.SetCloseFunc(func() {
+		_ = serverConn.Close()
+		_ = tcpConn.Close()
+	})
 
 	if srv.EnableForward {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -294,6 +298,7 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Serve
 		PackageBinPath: srv.Config.PackageBinPath,
 		EnableGPU:      srv.EnableGPU,
 		EnableNet:      srv.EnableNet,
+		SessionHandle:  sess,
 	}
 
 	for req := range requests {

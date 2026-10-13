@@ -1377,3 +1377,243 @@ func TestOpenSSHClientCommandExecution(t *testing.T) {
 		}
 	})
 }
+
+func TestTUIIntegrationKillAndClose(t *testing.T) {
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("openssh client (ssh) not found in PATH")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bubblewrap (bwrap) not found in PATH")
+	}
+
+	workDir := t.TempDir()
+
+	keyPath := filepath.Join(workDir, "id_ed25519")
+	pubKeyPath := keyPath + ".pub"
+	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-f", keyPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ssh-keygen failed: %v, out: %s", err, string(out))
+	}
+	pubBytes, err := os.ReadFile(pubKeyPath)
+	if err != nil {
+		t.Fatalf("read pubkey: %v", err)
+	}
+
+	forwardTrue := true
+	tomlBytes, err := toml.Marshal(&Config{
+		AuthorizedKeys: []string{strings.TrimSpace(string(pubBytes))},
+		Forward:        &forwardTrue,
+	})
+	if err != nil {
+		t.Fatalf("marshal toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, ".sshbox.toml"), tomlBytes, 0600); err != nil {
+		t.Fatalf("write toml: %v", err)
+	}
+
+	serverListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen server: %v", err)
+	}
+	defer serverListener.Close()
+	serverPort := serverListener.Addr().(*net.TCPAddr).Port
+
+	tuiMon := NewTUI(workDir, fmt.Sprintf("127.0.0.1:%d", serverPort))
+	server, err := NewServer(workDir, WithForward(true), WithMonitor(tuiMon))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	go func() {
+		_ = server.Serve(serverListener)
+	}()
+
+	baseArgs := []string{
+		"-F", "none",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "BatchMode=yes",
+		"-i", keyPath,
+		"-p", fmt.Sprintf("%d", serverPort),
+		"sshbox@127.0.0.1",
+	}
+
+	// 1. Test killing a jailed bwrap process
+	t.Run("KillJailedBwrapProcess", func(t *testing.T) {
+		sshArgs := append(append([]string{}, baseArgs...), "sleep 30")
+		sshCmd := exec.Command("ssh", sshArgs...)
+		sshDone := make(chan error, 1)
+
+		if err := sshCmd.Start(); err != nil {
+			t.Fatalf("failed to start ssh client: %v", err)
+		}
+		go func() {
+			sshDone <- sshCmd.Wait()
+		}()
+
+		// Wait until session is established and process is registered
+		var targetSess *SessionInfo
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			tuiMon.mu.RLock()
+			for _, s := range tuiMon.sessions {
+				if s.ID != 0 && s.Active {
+					s.mu.RLock()
+					hasProc := (s.process != nil)
+					s.mu.RUnlock()
+					if hasProc {
+						targetSess = s
+						break
+					}
+				}
+			}
+			tuiMon.mu.RUnlock()
+			if targetSess != nil {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		if targetSess == nil {
+			_ = sshCmd.Process.Kill()
+			t.Fatalf("timed out waiting for session with running bwrap process")
+		}
+
+		// Select this session in TUI and press 'x'
+		tuiMon.mu.Lock()
+		for i, s := range tuiMon.sessions {
+			if s == targetSess {
+				tuiMon.selectedIndex = i
+				break
+			}
+		}
+		tuiMon.mu.Unlock()
+
+		tuiMon.handleInput([]byte{'x'})
+
+		// The command should be terminated immediately
+		select {
+		case err := <-sshDone:
+			// ssh client should exit with non-zero
+			if err == nil {
+				t.Errorf("expected ssh command to fail after being killed, got nil error")
+			}
+		case <-time.After(3 * time.Second):
+			_ = sshCmd.Process.Kill()
+			t.Fatalf("ssh client did not terminate after 'x' pressed")
+		}
+	})
+
+	// 2. Test closing a forward session
+	t.Run("CloseForwardSession", func(t *testing.T) {
+		fwdListener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("find free port: %v", err)
+		}
+		fwdPort := fwdListener.Addr().(*net.TCPAddr).Port
+		fwdListener.Close()
+
+		backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen backend: %v", err)
+		}
+		defer backendListener.Close()
+		backendPort := backendListener.Addr().(*net.TCPAddr).Port
+
+		sshArgs := []string{
+			"-F", "none",
+			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "BatchMode=yes",
+			"-i", keyPath,
+			"-N",
+			"-R", fmt.Sprintf("%d:localhost:%d", fwdPort, backendPort),
+			"-p", fmt.Sprintf("%d", serverPort),
+			"sshbox@127.0.0.1",
+		}
+
+		sshCmd := exec.Command("ssh", sshArgs...)
+		sshDone := make(chan error, 1)
+
+		if err := sshCmd.Start(); err != nil {
+			t.Fatalf("start ssh forward: %v", err)
+		}
+		go func() {
+			sshDone <- sshCmd.Wait()
+		}()
+
+		// Wait for forward session to appear
+		var fwdSess *SessionInfo
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			tuiMon.mu.RLock()
+			for _, s := range tuiMon.sessions {
+				if s.ID != 0 && s.Active {
+					s.mu.RLock()
+					isFwd := strings.HasPrefix(s.Type, "fwd")
+					s.mu.RUnlock()
+					if isFwd {
+						fwdSess = s
+						break
+					}
+				}
+			}
+			tuiMon.mu.RUnlock()
+			if fwdSess != nil {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		if fwdSess == nil {
+			_ = sshCmd.Process.Kill()
+			t.Fatalf("timed out waiting for forward session")
+		}
+
+		// Select forward session in TUI and press 'x'
+		tuiMon.mu.Lock()
+		for i, s := range tuiMon.sessions {
+			if s == fwdSess {
+				tuiMon.selectedIndex = i
+				break
+			}
+		}
+		tuiMon.mu.Unlock()
+
+		tuiMon.handleInput([]byte{'x'})
+
+		// The forward session should terminate
+		select {
+		case <-sshDone:
+			// Success, forward client exited
+		case <-time.After(3 * time.Second):
+			_ = sshCmd.Process.Kill()
+			t.Fatalf("ssh forward client did not exit after 'x' pressed")
+		}
+	})
+
+	// 3. Test on server pane (selectedIndex = 0): 'x' does nothing
+	t.Run("ServerPaneDoesNothing", func(t *testing.T) {
+		tuiMon.mu.Lock()
+		tuiMon.selectedIndex = 0
+		tuiMon.mu.Unlock()
+
+		serverSess := tuiMon.sessions[0]
+		initialLogs := len(serverSess.Logs)
+		tuiMon.handleInput([]byte{'x'})
+
+		if !serverSess.Active {
+			t.Errorf("server session should remain active")
+		}
+		if len(serverSess.Logs) != initialLogs {
+			t.Errorf("no logs should be added to server session")
+		}
+
+		// Verify server is still happily accepting connections
+		testConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", serverPort))
+		if err != nil {
+			t.Fatalf("server should still be listening and accepting: %v", err)
+		}
+		testConn.Close()
+	})
+}
+

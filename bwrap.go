@@ -26,6 +26,7 @@ type SessionContext struct {
 	PackageBinPath string
 	EnableGPU      bool
 	EnableNet      bool
+	SessionHandle  SessionHandle
 }
 
 type WindowChange struct {
@@ -301,6 +302,10 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 			return fmt.Errorf("start pty: %w", err)
 		}
 		defer ptmx.Close()
+		if sCtx.SessionHandle != nil {
+			sCtx.SessionHandle.SetProcess(cmd.Process)
+			defer sCtx.SessionHandle.SetProcess(nil)
+		}
 
 		if sCtx.WinCh != nil {
 			go func() {
@@ -336,6 +341,10 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 		_ = stdinPipe.Close()
 		return fmt.Errorf("start process: %w", err)
 	}
+	if sCtx.SessionHandle != nil {
+		sCtx.SessionHandle.SetProcess(cmd.Process)
+		defer sCtx.SessionHandle.SetProcess(nil)
+	}
 
 	go func() {
 		_, _ = io.Copy(stdinPipe, channel)
@@ -353,7 +362,11 @@ func sendExitStatus(channel ssh.Channel, err error) {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-				status = uint32(ws.ExitStatus())
+				if ws.Signaled() {
+					status = uint32(128 + ws.Signal())
+				} else {
+					status = uint32(ws.ExitStatus())
+				}
 			} else {
 				status = 1
 			}

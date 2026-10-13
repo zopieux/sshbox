@@ -40,6 +40,8 @@ type SessionInfo struct {
 	Logs         []LogEntry
 	ScrollOffset int // 0 = at bottom; >0 = scrolled up by N lines
 	AutoScroll   bool
+	process      *os.Process
+	closeFunc    func()
 	mu           sync.RWMutex
 }
 
@@ -167,27 +169,31 @@ func (t *TUI) getLogAreaHeight() int {
 	return logAreaHeight
 }
 
-// Log adds a server-level log entry to the [Server] session.
-func (t *TUI) Log(format string, args ...any) {
+func (t *TUI) logToSession(s *SessionInfo, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	t.serverSession.mu.Lock()
-	t.serverSession.Logs = append(t.serverSession.Logs, LogEntry{
+	s.mu.Lock()
+	s.Logs = append(s.Logs, LogEntry{
 		Time:    time.Now(),
 		Message: msg,
 	})
 	logAreaHeight := t.getLogAreaHeight()
-	maxOffset := len(t.serverSession.Logs) - logAreaHeight
+	maxOffset := len(s.Logs) - logAreaHeight
 	if maxOffset <= 0 {
-		t.serverSession.ScrollOffset = 0
-		t.serverSession.AutoScroll = true
-	} else if !t.serverSession.AutoScroll && t.serverSession.ScrollOffset > 0 {
-		t.serverSession.ScrollOffset++
-		if t.serverSession.ScrollOffset > maxOffset {
-			t.serverSession.ScrollOffset = maxOffset
+		s.ScrollOffset = 0
+		s.AutoScroll = true
+	} else if !s.AutoScroll && s.ScrollOffset > 0 {
+		s.ScrollOffset++
+		if s.ScrollOffset > maxOffset {
+			s.ScrollOffset = maxOffset
 		}
 	}
-	t.serverSession.mu.Unlock()
+	s.mu.Unlock()
 	t.triggerRender()
+}
+
+// Log adds a server-level log entry to the [Server] session.
+func (t *TUI) Log(format string, args ...any) {
+	t.logToSession(t.serverSession, format, args...)
 }
 
 // NewSession creates and registers a new remote accepted connection session.
@@ -248,31 +254,27 @@ func (h *tuiSessionHandle) SetJail(workDir string, port int) {
 	h.t.triggerRender()
 }
 
-func (h *tuiSessionHandle) Log(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
+func (h *tuiSessionHandle) SetProcess(proc *os.Process) {
 	h.info.mu.Lock()
-	h.info.Logs = append(h.info.Logs, LogEntry{
-		Time:    time.Now(),
-		Message: msg,
-	})
-	logAreaHeight := h.t.getLogAreaHeight()
-	maxOffset := len(h.info.Logs) - logAreaHeight
-	if maxOffset <= 0 {
-		h.info.ScrollOffset = 0
-		h.info.AutoScroll = true
-	} else if !h.info.AutoScroll && h.info.ScrollOffset > 0 {
-		h.info.ScrollOffset++
-		if h.info.ScrollOffset > maxOffset {
-			h.info.ScrollOffset = maxOffset
-		}
-	}
+	h.info.process = proc
 	h.info.mu.Unlock()
-	h.t.triggerRender()
+}
+
+func (h *tuiSessionHandle) SetCloseFunc(fn func()) {
+	h.info.mu.Lock()
+	h.info.closeFunc = fn
+	h.info.mu.Unlock()
+}
+
+func (h *tuiSessionHandle) Log(format string, args ...any) {
+	h.t.logToSession(h.info, format, args...)
 }
 
 func (h *tuiSessionHandle) Close() {
 	h.info.mu.Lock()
 	h.info.Active = false
+	h.info.process = nil
+	h.info.closeFunc = nil
 	h.info.EndTime = time.Now()
 	dur := h.info.EndTime.Sub(h.info.StartTime).Truncate(time.Second)
 	h.info.Logs = append(h.info.Logs, LogEntry{
@@ -374,6 +376,7 @@ func (t *TUI) handleInput(b []byte) {
 			t.triggerRender()
 			return
 
+
 		case 'j':
 			if t.activePane == PaneSessions {
 				t.navigateSession(1)
@@ -392,6 +395,11 @@ func (t *TUI) handleInput(b []byte) {
 			t.triggerRender()
 			return
 
+		case 'x', 'X':
+			t.killSelectedSessionLocked()
+			t.triggerRender()
+			return
+
 		case 'g': // Home
 			t.scrollCurrentSessionToTop()
 			t.triggerRender()
@@ -402,7 +410,7 @@ func (t *TUI) handleInput(b []byte) {
 			t.triggerRender()
 			return
 
-		case 'c', 'C', 'x', 'X', 'd', 'D': // Clean dead sessions
+		case 'c', 'C', 'd', 'D': // Clean dead sessions
 			t.cleanDeadSessionsLocked()
 			t.triggerRender()
 			return
@@ -451,6 +459,46 @@ func (t *TUI) handleInput(b []byte) {
 	case seq == "\x1b[F" || seq == "\x1b[4~" || seq == "\x1b[8~": // End
 		t.scrollCurrentSessionToBottom()
 		t.triggerRender()
+	}
+}
+
+// KillSelectedSession immediately kills (-9) the jailed (bwrap) process that is selected highlighted,
+// or closes the session in case of a forward. On the server pane this does nothing.
+func (t *TUI) KillSelectedSession() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.killSelectedSessionLocked()
+	t.triggerRender()
+}
+
+func (t *TUI) killSelectedSessionLocked() {
+	if t.selectedIndex < 0 || t.selectedIndex >= len(t.sessions) {
+		return
+	}
+	s := t.sessions[t.selectedIndex]
+	if s.ID == 0 {
+		// on the server pane this does nothing
+		return
+	}
+	if !s.Active {
+		return
+	}
+
+	s.mu.Lock()
+	proc := s.process
+	closeFn := s.closeFunc
+	sessType := s.Type
+	s.process = nil
+	s.mu.Unlock()
+
+	if proc != nil {
+		t.logToSession(s, "Killed (-9) jailed process (PID %d)", proc.Pid)
+		_ = proc.Signal(syscall.SIGKILL)
+	} else if strings.HasPrefix(sessType, "fwd") || closeFn != nil {
+		t.logToSession(s, "Forward session closed by operator")
+		if closeFn != nil {
+			go closeFn()
+		}
 	}
 }
 
@@ -1000,7 +1048,7 @@ func (t *TUI) render() {
 	buf.WriteString("\r\n")
 
 	// 3. Status Bar (Keybindings & Hints)
-	statusText := fmt.Sprintf(" %s[Tab]%s Switch Pane  %s[↑/↓]%s %s  %s[PgUp/PgDn]%s Scroll Logs  %s[c]%s Clean  %s[q]%s Quit",
+	statusText := fmt.Sprintf(" %s[Tab]%s Switch Pane  %s[↑/↓]%s %s  %s[x]%s Kill  %s[PgUp/PgDn]%s Scroll Logs  %s[c]%s Clean  %s[q]%s Quit",
 		cBold, cReset,
 		cBold, cReset,
 		func() string {
@@ -1009,6 +1057,7 @@ func (t *TUI) render() {
 			}
 			return "Scroll Line"
 		}(),
+		cBold, cReset,
 		cBold, cReset,
 		cBold, cReset,
 		cBold, cReset,
