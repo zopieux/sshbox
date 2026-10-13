@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1165,4 +1166,214 @@ func TestOpenSSHClientRealWorldRemoteForwarding(t *testing.T) {
 	if strings.Contains(sshStderr.String(), "unknown listen_port") {
 		t.Fatalf("OpenSSH client warned about unknown listen_port: %s", sshStderr.String())
 	}
+}
+
+func TestOpenSSHClientCommandExecution(t *testing.T) {
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("openssh client (ssh) not found in PATH")
+	}
+
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bubblewrap (bwrap) not found in PATH")
+	}
+
+	workDir := t.TempDir()
+
+	keyPath := filepath.Join(workDir, "id_ed25519")
+	pubKeyPath := keyPath + ".pub"
+	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-f", keyPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ssh-keygen failed: %v, out: %s", err, string(out))
+	}
+	pubBytes, err := os.ReadFile(pubKeyPath)
+	if err != nil {
+		t.Fatalf("read pubkey: %v", err)
+	}
+
+	tomlBytes, err := toml.Marshal(&Config{
+		AuthorizedKeys: []string{strings.TrimSpace(string(pubBytes))},
+	})
+	if err != nil {
+		t.Fatalf("marshal toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, ".sshbox.toml"), tomlBytes, 0600); err != nil {
+		t.Fatalf("write toml: %v", err)
+	}
+
+	serverListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen server: %v", err)
+	}
+	defer serverListener.Close()
+	serverPort := serverListener.Addr().(*net.TCPAddr).Port
+
+	server, err := NewServer(workDir)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	go func() {
+		_ = server.Serve(serverListener)
+	}()
+
+	baseArgs := []string{
+		"-F", "none",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "BatchMode=yes",
+		"-i", keyPath,
+		"-p", fmt.Sprintf("%d", serverPort),
+		"sshbox@127.0.0.1",
+	}
+
+	t.Run("NonInteractiveCommandWithOpenStdin", func(t *testing.T) {
+		// Create an open pipe for stdin to simulate running from an interactive terminal
+		// where stdin is not closed.
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		defer r.Close()
+		defer w.Close()
+
+		sshArgs := append(append([]string{}, baseArgs...), "echo hello")
+		sshCmd := exec.Command("ssh", sshArgs...)
+		sshCmd.Stdin = r
+		var stdout, stderr bytes.Buffer
+		sshCmd.Stdout = &stdout
+		sshCmd.Stderr = &stderr
+
+		done := make(chan error, 1)
+		if err := sshCmd.Start(); err != nil {
+			t.Fatalf("failed to start ssh client: %v", err)
+		}
+
+		go func() {
+			done <- sshCmd.Wait()
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("ssh command failed: %v, stderr: %s", err, stderr.String())
+			}
+			if strings.TrimSpace(stdout.String()) != "hello" {
+				t.Fatalf("expected 'hello', got %q", stdout.String())
+			}
+		case <-time.After(3 * time.Second):
+			_ = sshCmd.Process.Kill()
+			t.Fatalf("ssh command hung indefinitely! stdout: %q, stderr: %q", stdout.String(), stderr.String())
+		}
+	})
+
+	t.Run("NonInteractiveCommandWithPipedStdin", func(t *testing.T) {
+		sshArgs := append(append([]string{}, baseArgs...), "cat")
+		sshCmd := exec.Command("ssh", sshArgs...)
+		sshCmd.Stdin = strings.NewReader("hello from piped stdin\n")
+		var stdout, stderr bytes.Buffer
+		sshCmd.Stdout = &stdout
+		sshCmd.Stderr = &stderr
+
+		done := make(chan error, 1)
+		if err := sshCmd.Start(); err != nil {
+			t.Fatalf("failed to start ssh client: %v", err)
+		}
+
+		go func() {
+			done <- sshCmd.Wait()
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("ssh command failed: %v, stderr: %s", err, stderr.String())
+			}
+			if strings.TrimSpace(stdout.String()) != "hello from piped stdin" {
+				t.Fatalf("expected 'hello from piped stdin', got %q", stdout.String())
+			}
+		case <-time.After(3 * time.Second):
+			_ = sshCmd.Process.Kill()
+			t.Fatalf("ssh command hung indefinitely! stdout: %q, stderr: %q", stdout.String(), stderr.String())
+		}
+	})
+
+	t.Run("NonInteractiveCommandNonZeroExit", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		defer r.Close()
+		defer w.Close()
+
+		sshArgs := append(append([]string{}, baseArgs...), "sh -c 'exit 42'")
+		sshCmd := exec.Command("ssh", sshArgs...)
+		sshCmd.Stdin = r
+		var stdout, stderr bytes.Buffer
+		sshCmd.Stdout = &stdout
+		sshCmd.Stderr = &stderr
+
+		done := make(chan error, 1)
+		if err := sshCmd.Start(); err != nil {
+			t.Fatalf("failed to start ssh client: %v", err)
+		}
+
+		go func() {
+			done <- sshCmd.Wait()
+		}()
+
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("expected error exit status 42, got nil")
+			}
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				if exitErr.ExitCode() != 42 {
+					t.Fatalf("expected exit code 42, got %d", exitErr.ExitCode())
+				}
+			} else {
+				t.Fatalf("unexpected error type: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			_ = sshCmd.Process.Kill()
+			t.Fatalf("ssh command hung indefinitely!")
+		}
+	})
+
+	t.Run("NonInteractiveCommandStderr", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		defer r.Close()
+		defer w.Close()
+
+		sshArgs := append(append([]string{}, baseArgs...), "sh -c 'echo custom_error_output >&2'")
+		sshCmd := exec.Command("ssh", sshArgs...)
+		sshCmd.Stdin = r
+		var stdout, stderr bytes.Buffer
+		sshCmd.Stdout = &stdout
+		sshCmd.Stderr = &stderr
+
+		done := make(chan error, 1)
+		if err := sshCmd.Start(); err != nil {
+			t.Fatalf("failed to start ssh client: %v", err)
+		}
+
+		go func() {
+			done <- sshCmd.Wait()
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("ssh command failed: %v, stderr: %s", err, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "custom_error_output") {
+				t.Fatalf("expected stderr to contain 'custom_error_output', got %q", stderr.String())
+			}
+		case <-time.After(3 * time.Second):
+			_ = sshCmd.Process.Kill()
+			t.Fatalf("ssh command hung indefinitely!")
+		}
+	})
 }

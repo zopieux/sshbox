@@ -324,13 +324,23 @@ func runInBwrap(channel ssh.Channel, dir string, sCtx SessionContext) error {
 		return waitErr
 	}
 
-	cmd.Stdin = channel
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("stdin pipe: %w", err)
+	}
+
 	cmd.Stdout = channel
 	cmd.Stderr = channel.Stderr()
 
 	if err := cmd.Start(); err != nil {
+		_ = stdinPipe.Close()
 		return fmt.Errorf("start process: %w", err)
 	}
+
+	go func() {
+		_, _ = io.Copy(stdinPipe, channel)
+		_ = stdinPipe.Close()
+	}()
 
 	waitErr := cmd.Wait()
 	sendExitStatus(channel, waitErr)

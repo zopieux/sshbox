@@ -253,7 +253,40 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Serve
 	defer channel.Close()
 
 	winCh := make(chan WindowChange, 16)
-	defer close(winCh)
+	var winChMu sync.Mutex
+	winChClosed := false
+	closeWinCh := func() {
+		winChMu.Lock()
+		defer winChMu.Unlock()
+		if !winChClosed {
+			winChClosed = true
+			close(winCh)
+		}
+	}
+	defer closeWinCh()
+
+	drainRequests := func() {
+		for r := range requests {
+			if r.Type == "window-change" {
+				var msg winChangeMsg
+				if err := ssh.Unmarshal(r.Payload, &msg); err == nil {
+					winChMu.Lock()
+					if !winChClosed {
+						select {
+						case winCh <- WindowChange{Rows: msg.Rows, Cols: msg.Cols}:
+						default:
+						}
+					}
+					winChMu.Unlock()
+					_ = r.Reply(true, nil)
+				} else {
+					_ = r.Reply(false, nil)
+				}
+			} else {
+				_ = r.Reply(false, nil)
+			}
+		}
+	}
 
 	sCtx := SessionContext{
 		WinCh:          winCh,
@@ -283,10 +316,14 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Serve
 			if err := ssh.Unmarshal(req.Payload, &msg); err == nil {
 				sCtx.Cols = msg.Cols
 				sCtx.Rows = msg.Rows
-				select {
-				case winCh <- WindowChange{Rows: msg.Rows, Cols: msg.Cols}:
-				default:
+				winChMu.Lock()
+				if !winChClosed {
+					select {
+					case winCh <- WindowChange{Rows: msg.Rows, Cols: msg.Cols}:
+					default:
+					}
 				}
+				winChMu.Unlock()
 				_ = req.Reply(true, nil)
 			} else {
 				_ = req.Reply(false, nil)
@@ -305,24 +342,7 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Serve
 			_ = req.Reply(true, nil)
 			sess.SetType("shell")
 			sess.Log("Executing interactive shell in jail")
-			go func() {
-				for r := range requests {
-					if r.Type == "window-change" {
-						var msg winChangeMsg
-						if err := ssh.Unmarshal(r.Payload, &msg); err == nil {
-							select {
-							case winCh <- WindowChange{Rows: msg.Rows, Cols: msg.Cols}:
-							default:
-							}
-							_ = r.Reply(true, nil)
-						} else {
-							_ = r.Reply(false, nil)
-						}
-					} else {
-						_ = r.Reply(false, nil)
-					}
-				}
-			}()
+			go drainRequests()
 			if err := runInBwrap(channel, srv.WorkDir, sCtx); err != nil {
 				sess.Log("Bubblewrap interactive shell exited with error: %v", err)
 			} else {
@@ -352,6 +372,7 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, srv *Serve
 				return
 			}
 
+			go drainRequests()
 			sCtx.Command = msg.Command
 			if err := runInBwrap(channel, srv.WorkDir, sCtx); err != nil {
 				sess.Log("Bubblewrap exec command %q exited with error: %v", msg.Command, err)
